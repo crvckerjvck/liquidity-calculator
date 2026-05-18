@@ -1,0 +1,8 @@
+venv/
+launch_silent.vbs
+*.db
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+data/pools_cache/
+*.log

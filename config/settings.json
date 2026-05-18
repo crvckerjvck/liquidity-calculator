@@ -1,0 +1,18 @@
+{
+  "il_warning_percent": 3.0,
+  "il_critical_percent": 5.0,
+  "fees_reinvest_percent": 10.0,
+  "gas_enabled": true,
+  "gas_threshold_usd": 5.0,
+  "max_apr_percent": 60.0,
+  "min_apr_percent": 0.5,
+  "use_pcs_backtester": true,
+  "heuristic": {
+    "base_apr_eth": 7.0,
+    "base_apr_btc": 5.0,
+    "base_apr_other": 10.0,
+    "reference_width": 2.0,
+    "max_width_multiplier": 4.0,
+    "min_width_multiplier": 0.8
+  }
+}
