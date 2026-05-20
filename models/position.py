@@ -26,6 +26,7 @@ class Position:
     liquidity: float = 0.0
     is_public: bool = False
     owner_id: str = "admin"
+    status: str = "active"
 
     @property
     def base_symbol(self) -> str:
@@ -64,6 +65,7 @@ class Position:
             "liquidity": self.liquidity,
             "is_public": self.is_public,
             "owner_id": self.owner_id,
+            "status": self.status,
         }
 
     @classmethod
@@ -100,4 +102,5 @@ class Position:
             liquidity=_f(row['liquidity'] if 'liquidity' in row.keys() else 0),
             is_public=bool(row['is_public']) if 'is_public' in row.keys() else False,
             owner_id=_s(row['owner_id'] if 'owner_id' in row.keys() else 'admin', 'admin'),
+            status=_s(row['status'] if 'status' in row.keys() else 'active', 'active'),
         )

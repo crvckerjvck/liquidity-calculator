@@ -1,5 +1,34 @@
 import numpy as np
+from datetime import date
 from data.price_client import calculate_volatility, get_historical_prices
+
+def calculate_actual_apy(initial_body_usd: float, current_body_usd: float, total_fees_usd: float, days_active: int, created_at_str: str = None) -> float | None:
+    """
+    Рассчитывает фактический APY с учётом изменений тела депозита и комиссий/наград.
+    
+    Формула:
+    - total_gain = (current_body_usd - initial_body_usd) + total_fees_usd
+    - actual_apy = (total_gain / initial_body_usd) * (365 / days_active) * 100
+    - Ограничение: от -100% до +500%
+    
+    Parameters:
+    - initial_body_usd: начальная стоимость позиции (USD)
+    - current_body_usd: текущая стоимость тела депозита (USD), без комиссий
+    - total_fees_usd: накопленные комиссии/награды (USD)
+    - days_active: количество дней активной позиции (минимум 1)
+    
+    Returns:
+    - float: фактический APY в процентах, или None если данные недостаточны
+    """
+    if initial_body_usd <= 0 or days_active < 1:
+        return None
+    
+    total_gain = (current_body_usd - initial_body_usd) + total_fees_usd
+    actual_apy = (total_gain / initial_body_usd) * (365 / days_active) * 100
+    
+    # Ограничение от -100% до +500%
+    return max(-100, min(500, actual_apy))
+
 
 def calculate_apr(volume_24h: float, fee_tier: float, tvl_usd: float) -> float:
     """

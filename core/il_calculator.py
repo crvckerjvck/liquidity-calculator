@@ -25,3 +25,15 @@ def calculate_il(current_price: float, lower_price: float, upper_price: float, i
     current_value = curr0 * current_price + curr1
     
     return il_percent, il_dollar, current_value
+
+
+def calculate_il_v2(initial_price: float, current_price: float) -> float:
+    """
+    Возвращает Impermanent Loss в процентах для V2 пула (отрицательное число).
+    Формула: IL = 2 * sqrt(price_ratio) / (1 + price_ratio) - 1
+    """
+    if initial_price <= 0 or current_price <= 0:
+        return 0.0
+    price_ratio = current_price / initial_price
+    il = 2 * (price_ratio ** 0.5) / (1 + price_ratio) - 1
+    return il * 100

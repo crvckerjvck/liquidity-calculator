@@ -31,6 +31,10 @@ def get_current_price(symbol: str, network: str = "ethereum") -> Optional[float]
     """
     base_symbol = symbol.split('/')[0].upper() if '/' in symbol else symbol.upper()
     
+    # 0. Стабильные монеты (fast-path)
+    if base_symbol in ['USDC', 'USDT', 'DAI', 'USDE', 'FRAX']:
+        return 1.0
+
     # 1. Binance (самый надёжный источник для крупных токенов)
     binance_sym = BINANCE_MAP.get(base_symbol)
     if binance_sym:

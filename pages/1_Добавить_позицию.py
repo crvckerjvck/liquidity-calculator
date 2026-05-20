@@ -56,6 +56,10 @@ with st.form("manual_add_form"):
                 help="Используется для точного расчёта ликвидности L. Если 0 — будет определена автоматически."
             )
 
+        # Добавляем ввод даты открытия позиции
+        from datetime import date
+        creation_date = st.date_input("Дата открытия", value=date.today(), format="YYYY-MM-DD")
+
         st.divider()
 
         # ── Token amounts ────────────────────────────────────────────────────
@@ -137,6 +141,7 @@ with st.form("manual_add_form"):
                         liquidity=liquidity,
                         is_public=is_public,
                         owner_id=owner_id,
+                        created_at=creation_date.isoformat(),
                     )
                     st.success(f"✅ Позиция {pair.upper()} добавлена! L = {liquidity:.4f}")
                     st.balloons()
