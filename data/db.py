@@ -88,12 +88,13 @@ def initialize_database():
         ''')
 
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS position_fees_log (
+            CREATE TABLE IF NOT EXISTS fees_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 position_id INTEGER,
-                timestamp TEXT,
-                fee_token0 REAL,
-                fee_token1 REAL,
+                token0_amount REAL DEFAULT 0,
+                token1_amount REAL DEFAULT 0,
+                reinvested INTEGER DEFAULT 0,
+                logged_at TEXT,
                 FOREIGN KEY(position_id) REFERENCES positions(id)
             )
         ''')
@@ -296,6 +297,22 @@ def initialize_database():
                 )
             ''')
             cursor.execute("INSERT INTO _migrations (name) VALUES ('add_auth_tokens_table')")
+
+        # Миграция: перенос из position_fees_log (старая схема) в fees_log
+        cursor.execute("SELECT name FROM _migrations WHERE name = 'migrate_position_fees_log'")
+        if not cursor.fetchone():
+            try:
+                cursor.execute("SELECT count(*) FROM position_fees_log")
+                has_old_table = True
+            except sqlite3.OperationalError:
+                has_old_table = False
+            if has_old_table:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO fees_log (position_id, token0_amount, token1_amount, logged_at, reinvested)
+                    SELECT position_id, fee_token0, fee_token1, timestamp, 0 FROM position_fees_log
+                ''')
+                cursor.execute("DROP TABLE position_fees_log")
+            cursor.execute("INSERT INTO _migrations (name) VALUES ('migrate_position_fees_log')")
 
         conn.commit()
 
@@ -559,11 +576,8 @@ def clear_all_fees(pos_id: int):
     with get_db() as conn:
         cursor = conn.cursor()
         
-        # Удаление истории для обеих таблиц
+        # Удаление истории комиссий
         cursor.execute('DELETE FROM fees_log WHERE position_id = ?', (pos_id,))
-        cursor.execute('DELETE FROM custom_fees WHERE position_id = ?', (pos_id,))
-        
-        cursor.execute('DELETE FROM position_fees_log WHERE position_id = ?', (pos_id,))
         
         # Сброс счетчиков в positions
         cursor.execute('''
