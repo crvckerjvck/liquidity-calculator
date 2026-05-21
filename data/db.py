@@ -232,6 +232,54 @@ def initialize_database():
             cursor.execute("UPDATE positions SET token1_amount_initial = token1_amount WHERE token1_amount_initial = 0")
             cursor.execute("INSERT INTO _migrations (name) VALUES ('set_initial_amounts')")
 
+        # Миграция: добавить колонки token0_current, token1_current в positions
+        cursor.execute("SELECT name FROM _migrations WHERE name = 'add_current_columns'")
+        if not cursor.fetchone():
+            try:
+                cursor.execute("ALTER TABLE positions ADD COLUMN token0_current REAL DEFAULT 0.0")
+                cursor.execute("ALTER TABLE positions ADD COLUMN token1_current REAL DEFAULT 0.0")
+                # Инициализируем текущие балансы из начальных для старых позиций
+                cursor.execute("UPDATE positions SET token0_current = token0_amount_initial, token1_current = token1_amount_initial")
+                cursor.execute("INSERT INTO _migrations (name) VALUES ('add_current_columns')")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e):
+                    print(f"Warning: Could not add current columns: {e}")
+
+        # Миграция: пересчитать ликвидность для старых позиций, если она равна 0
+        cursor.execute("SELECT name FROM _migrations WHERE name = 'recompute_liquidity_v2'")
+        if not cursor.fetchone():
+            import math
+            cursor.execute("SELECT id, lower_price, upper_price, initial_price, token0_amount_initial, token1_amount_initial FROM positions WHERE (liquidity IS NULL OR liquidity = 0) AND lower_price > 0 AND upper_price > lower_price")
+            rows = cursor.fetchall()
+            for row in rows:
+                pos_id, lower, upper, init_price, t0_initial, t1_initial = row
+                try:
+                    sqrt_low = math.sqrt(lower)
+                    sqrt_high = math.sqrt(upper)
+                    if init_price <= lower:
+                        L = t0_initial / ((1.0 / sqrt_low) - (1.0 / sqrt_high)) if t0_initial > 0 else 0.0
+                    elif init_price >= upper:
+                        L = t1_initial / (sqrt_high - sqrt_low) if t1_initial > 0 else 0.0
+                    else:
+                        sqrt_cur = math.sqrt(init_price)
+                        amount0_from_L = 1.0 / sqrt_cur - 1.0 / sqrt_high
+                        amount1_from_L = sqrt_cur - sqrt_low
+                        if amount0_from_L > 0 and amount1_from_L > 0:
+                            L0 = t0_initial / amount0_from_L
+                            L1 = t1_initial / amount1_from_L
+                            L = min(L0, L1)
+                        elif amount0_from_L > 0:
+                            L = t0_initial / amount0_from_L
+                        elif amount1_from_L > 0:
+                            L = t1_initial / amount1_from_L
+                        else:
+                            L = 0.0
+                    if L > 0:
+                        cursor.execute("UPDATE positions SET liquidity = ? WHERE id = ?", (L, pos_id))
+                except Exception as e:
+                    print(f"Error recomputing liquidity for pos {pos_id}: {e}")
+            cursor.execute("INSERT INTO _migrations (name) VALUES ('recompute_liquidity_v2')")
+
         # Миграция для кастомных позиций (APY)
         cursor.execute("SELECT name FROM _migrations WHERE name = 'add_custom_apy_columns'")
         if not cursor.fetchone():
@@ -278,13 +326,15 @@ def add_position(
          fees_token0, fees_token1, wallet_address,
          initial_price, goal, target_token, target_amount,
          fees_token0_total, fees_token1_total, liquidity, is_public, owner_id, status, created_at,
-         token0_amount_initial, token1_amount_initial)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         token0_amount_initial, token1_amount_initial,
+         token0_current, token1_current)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         network, dex, pair, lower_price, upper_price,
         token0_amount, token1_amount, fees_token0, fees_token1, wallet_address,
         initial_price, goal, target_token, target_amount,
         fees_token0, fees_token1, liquidity, int(is_public), owner_id, status, created_at,
+        token0_amount, token1_amount,
         token0_amount, token1_amount
     ))
 
@@ -375,6 +425,17 @@ def update_position_date(pos_id: int, created_at: str):
         )
 
 
+@retry_db
+def update_position_current_balances(pos_id: int, token0_current: float, token1_current: float):
+    """Обновляет текущие балансы позиции (ручная корректировка)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE positions SET token0_current = ?, token1_current = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?',
+            (token0_current, token1_current, pos_id)
+        )
+
+
 # ─── Fee Logging ─────────────────────────────────────────────────────────────
 
 @retry_db
@@ -407,6 +468,8 @@ def log_fees(pos_id: int, token0_amount: float, token1_amount: float, reinvested
                 UPDATE positions
                 SET token0_amount = token0_amount + ?,
                     token1_amount = token1_amount + ?,
+                    token0_current = token0_current + ?,
+                    token1_current = token1_current + ?,
                     fees_token0 = fees_token0 + ?,
                     fees_token1 = fees_token1 + ?,
                     fees_token0_total = fees_token0_total + ?,
@@ -415,8 +478,7 @@ def log_fees(pos_id: int, token0_amount: float, token1_amount: float, reinvested
                     {update_liquidity_sql}
                 WHERE id = ?
             '''
-            params = [token0_amount, token1_amount, token0_amount, token1_amount,
-                      token0_amount, token1_amount]
+            params = [token0_amount, token1_amount, token0_amount, token1_amount, token0_amount, token1_amount, token0_amount, token1_amount]
             if new_liquidity > 0:
                 params.append(new_liquidity)
             params.append(pos_id)
@@ -454,9 +516,11 @@ def delete_fee_log(log_id: int):
                 UPDATE positions
                 SET token0_amount = MAX(0, token0_amount - ?),
                     token1_amount = MAX(0, token1_amount - ?),
+                    token0_current = MAX(0, token0_current - ?),
+                    token1_current = MAX(0, token1_current - ?),
                     last_updated = CURRENT_TIMESTAMP
                 WHERE id = ?
-            ''', (f0, f1, pos_id))
+            ''', (f0, f1, f0, f1, pos_id))
 
         # Удаляем запись
         cursor.execute('DELETE FROM fees_log WHERE id = ?', (log_id,))
@@ -519,19 +583,6 @@ def get_fees_log(pos_id: int) -> list:
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM fees_log WHERE position_id = ? ORDER BY logged_at DESC', (pos_id,))
         return cursor.fetchall()
-
-
-def get_weekly_fees(pos_id: int) -> tuple:
-    """Возвращает сумму комиссий за последние 7 дней."""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT COALESCE(SUM(token0_amount), 0), COALESCE(SUM(token1_amount), 0)
-            FROM fees_log
-            WHERE position_id = ? AND logged_at >= datetime('now', '-7 days')
-        ''', (pos_id,))
-        row = cursor.fetchone()
-        return (float(row[0]), float(row[1])) if row else (0.0, 0.0)
 
 
 # ─── Custom Positions CRUD ───────────────────────────────────────────────────

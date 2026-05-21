@@ -5,22 +5,23 @@ from streamlit_autorefresh import st_autorefresh
 
 from data.db import (
     initialize_database, get_all_positions, update_position_price,
-    log_fees, delete_position, update_position_ranges, get_weekly_fees,
+    log_fees, delete_position, update_position_ranges,
     update_position_status, update_position_date, get_fees_log, delete_fee_log,
     clear_all_fees, get_custom_positions, soft_delete_custom_position,
     hard_delete_custom_position, update_custom_position, update_position_visibility,
     update_v2_pool_visibility, update_custom_visibility,
     update_custom_body, update_custom_fees,
     get_v2_pools, get_public_v2_pools, get_public_custom_positions,
+    update_position_current_balances,
     update_v2_pool, soft_delete_v2_pool, hard_delete_v2_pool,
     log_v2_fees, get_v2_fees_log, clear_all_v2_fees
 )
 from data.price_client import get_current_price
 from core.position_state import (
-    compute_liquidity, compute_current_balances, compute_il, range_proximity,
+    compute_liquidity, compute_il, range_proximity,
     get_composition_at_bounds
 )
-from core.il_calculator import calculate_il_v2
+from core.il_calculator import calculate_il_v2, compute_v3_balances
 from core.goal_recommendations import get_goal_recommendation, GOAL_LABELS
 from core.metrics import calculate_actual_apy
 
@@ -77,6 +78,21 @@ def visibility_dialog(pos: dict):
     new_val = st.checkbox("Публичная позиция (видна гостям)", value=current)
     if st.button("Сохранить"):
         update_position_visibility(pos['id'], int(new_val))
+        st.rerun()
+
+
+@st.dialog("✏️ Изменить текущие балансы")
+def edit_balance_dialog(pos: dict):
+    st.markdown(f"**{pos['pair']}**")
+    base_sym = pos['pair'].split('/')[0] if '/' in pos['pair'] else pos['pair']
+    quote_sym = pos['pair'].split('/')[1] if '/' in pos['pair'] else 'USDC'
+    curr_t0 = float(pos.get('token0_current') or pos.get('token0_amount') or 0.0)
+    curr_t1 = float(pos.get('token1_current') or pos.get('token1_amount') or 0.0)
+    new_t0 = st.number_input(f"Текущее количество {base_sym}", value=curr_t0, min_value=0.0, format="%.8f")
+    new_t1 = st.number_input(f"Текущее количество {quote_sym}", value=curr_t1, min_value=0.0, format="%.2f")
+    if st.button("Сохранить"):
+        update_position_current_balances(pos['id'], new_t0, new_t1)
+        st.success("Балансы обновлены!")
         st.rerun()
 
 
@@ -274,7 +290,7 @@ def rebalance_dialog(pos: dict, current_price: float):
     if new_lower < new_upper:
         new_l = compute_liquidity(current_price, new_lower, new_upper,
                                   pos['token0_amount'], pos['token1_amount'])
-        new_a0, new_a1 = compute_current_balances(new_l, new_lower, new_upper, current_price)
+        new_a0, new_a1 = compute_v3_balances(new_l, new_lower, new_upper, current_price)
         st.info(f"После ребалансировки: ≈{new_a0:.4g} {base_sym} + {new_a1:.4g} {quote_sym}")
 
     if st.button("✅ Подтвердить ребалансировку"):
@@ -283,7 +299,7 @@ def rebalance_dialog(pos: dict, current_price: float):
         else:
             new_l = compute_liquidity(current_price, new_lower, new_upper,
                                       pos['token0_amount'], pos['token1_amount'])
-            new_a0, new_a1 = compute_current_balances(new_l, new_lower, new_upper, current_price)
+            new_a0, new_a1 = compute_v3_balances(new_l, new_lower, new_upper, current_price)
             update_position_ranges(pos_id, new_lower, new_upper, current_price, new_a0, new_a1, new_l)
             st.success("Диапазон обновлен!")
             st.rerun()
@@ -437,17 +453,15 @@ for raw in visible_positions:
 
     q_price = token1_price_of(pair, price)
 
-    # V3 balances from liquidity L
-    L = float(pos.get('liquidity') or 0.0)
+    # V3 balances: вычисляем через compute_v3_balances или fallback на ручные/начальные
     lower = float(pos.get('lower_price') or 0.0)
     upper = float(pos.get('upper_price') or 0.0)
-
+    L = float(pos.get('liquidity') or 0.0)
     if L > 0 and lower > 0 and upper > lower and price > 0:
-        curr0, curr1 = compute_current_balances(L, lower, upper, price)
+        curr0, curr1 = compute_v3_balances(L, lower, upper, price)
     else:
-        # Fallback: use stored amounts (no L computed)
-        curr0 = float(pos.get('token0_amount') or 0.0)
-        curr1 = float(pos.get('token1_amount') or 0.0)
+        curr0 = float(pos.get('token0_current') or pos.get('token0_amount_initial') or pos.get('token0_amount') or 0.0)
+        curr1 = float(pos.get('token1_current') or pos.get('token1_amount_initial') or pos.get('token1_amount') or 0.0)
 
     pos['curr0'] = curr0
     pos['curr1'] = curr1
@@ -463,10 +477,15 @@ for raw in visible_positions:
     entry_value = (token0_initial * init_price_for_il + token1_initial) if init_price_for_il > 0 else 0.0
     pos['entry_value'] = entry_value
 
-    # IL
+    # IL: всегда рассчитываем на основе ликвидности, а не ручных балансов
     if price > 0 and entry_value > 0 and init_price_for_il > 0:
         hold_value = token0_initial * price + token1_initial
-        pool_value = curr0 * price + curr1 * q_price
+        # Для IL используем compute_v3_balances (без учёта ручной корректировки)
+        if L > 0 and lower > 0 and upper > lower and price > 0:
+            il_curr0, il_curr1 = compute_v3_balances(L, lower, upper, price)
+        else:
+            il_curr0, il_curr1 = token0_initial, token1_initial
+        pool_value = il_curr0 * price + il_curr1 * q_price
         if hold_value > 0:
             il_pct = (pool_value - hold_value) / hold_value * 100.0
             il_usd = pool_value - hold_value
@@ -509,40 +528,26 @@ for raw in visible_positions:
         if price > 0:
             il_list.append(il_pct)
 
-    # Weekly APR estimate
-    w0, w1 = get_weekly_fees(pos['id'])
-    w_val = w0 * price + w1 * q_price
-    if pos_val > 0 and w_val > 0:
-        weekly_apr = (w_val / pos_val) * 52 * 100
-    else:
-        weekly_apr = None
-    pos['weekly_apr'] = weekly_apr
-
     # --- Calculate total APR --- #
     apr_total = None
     created_at_str = pos.get('created_at')
-    token0_initial = float(pos.get('token0_amount') or 0.0)
-    token1_initial = float(pos.get('token1_amount') or 0.0)
-    initial_price_for_deposit = float(pos.get('initial_price') or 0.0)
-    deposit_usd = (token0_initial * initial_price_for_deposit) + token1_initial
+    entry_val_for_apr = pos.get('entry_value') or 0.0
 
     if created_at_str:
         try:
             created_date = datetime.strptime(created_at_str.split('T')[0], '%Y-%m-%d').date()
             days_active = (date.today() - created_date).days
             
-            if days_active > 0 and deposit_usd > 0:
+            if days_active > 0 and entry_val_for_apr > 0:
                 fees_token0_total = float(pos.get('fees_token0_total') or 0.0)
                 fees_token1_total = float(pos.get('fees_token1_total') or 0.0)
-                current_price_for_fees = pos.get('current_price') or price
-                total_fees_usd_calc = (fees_token0_total * current_price_for_fees) + fees_token1_total
+                total_fees_usd_calc = (fees_token0_total * price) + (fees_token1_total * q_price)
 
-                apr_total = (total_fees_usd_calc / deposit_usd) * (365 / days_active) * 100
-                apr_total = max(0, min(200, apr_total)) # Clamp at 200%
+                apr_total = (total_fees_usd_calc / entry_val_for_apr) * (365 / days_active) * 100
+                apr_total = max(0, min(200, apr_total))
         except ValueError:
             pass
     pos['apr_total'] = apr_total
-    pos['deposit_usd'] = deposit_usd
     # --- End calculate total APR --- #
 
     positions_enriched.append(pos)
@@ -638,7 +643,7 @@ for raw in v2_raw:
     pos['il_usd'] = pos_val - hold_value
     pos['price0'] = price0
     pos['price1'] = price1
-    pos['entry_usd'] = initial_val * price1 # Assuming price1 is stable-ish
+    pos['entry_usd'] = initial_val
     
     fees0 = float(pos.get('fees_token0_total') or 0.0)
     fees1 = float(pos.get('fees_token1_total') or 0.0)
@@ -681,8 +686,8 @@ def render_position_card(pos):
         h_col, b_col = st.columns([4, 2])
         with h_col:
             pos_val = pos.get('current_value', 0.0)
-            init0 = float(pos.get('token0_amount') or 0.0)
-            init1 = float(pos.get('token1_amount') or 0.0)
+            init0 = float(pos.get('token0_amount_initial') or pos.get('token0_amount') or 0.0)
+            init1 = float(pos.get('token1_amount_initial') or pos.get('token1_amount') or 0.0)
             init_p = float(pos.get('initial_price') or 0.0)
             initial_val = (init0 * init_p + init1) if init_p > 0 else 0.0
             fees_usd = pos.get('fees_usd', 0.0)
@@ -714,7 +719,7 @@ def render_position_card(pos):
 
         with b_col:
             if st.session_state.authenticated:
-                bc1, bc2, bc3, bc4 = st.columns(4)
+                bc1, bc2, bc3, bc4, bc5 = st.columns(5)
                 with bc1:
                     if st.button("💰 Комиссии", key=f"fee_{pos['id']}"):
                         fee_dialog(pos, price)
@@ -722,9 +727,12 @@ def render_position_card(pos):
                     if st.button("⚖️ Ребаланс", key=f"reb_{pos['id']}"):
                         rebalance_dialog(pos, price)
                 with bc3:
+                    if st.button("✏️ Изменить текущие балансы", key=f"bal_{pos['id']}", help="Изменить текущие балансы"):
+                        edit_balance_dialog(pos)
+                with bc4:
                     if st.button("🌐", key=f"vis_{pos['id']}", help="Изменить публичность"):
                         visibility_dialog(pos)
-                with bc4:
+                with bc5:
                     if st.button("🗑 Удалить", key=f"del_{pos['id']}"):
                         delete_position(pos['id'])
                         st.rerun()
@@ -764,16 +772,19 @@ def render_position_card(pos):
             # Общая стоимость позиции и PnL
             pos_val = pos.get('current_value', 0.0)
             init_price = float(pos.get('initial_price') or 0.0)
-            init0 = float(pos.get('token0_amount') or 0.0)
-            init1 = float(pos.get('token1_amount') or 0.0)
-            entry_value = (init0 * init_price + init1) if init_price > 0 else 0.0
-            
-            pnl_usd = (pos_val + pos.get('fees_usd', 0.0)) - entry_value if entry_value > 0 else 0.0
-            pnl_pct = (pnl_usd / entry_value * 100) if entry_value > 0 else 0.0
-            
-            pnl_str = f" <span style='color:{'#2ecc71' if pnl_usd >= 0 else '#e74c3c'}; font-size: 0.9rem; font-weight: bold;'> ({'+' if pnl_usd >= 0 else ''}{pnl_pct:.1f}%)</span>" if entry_value > 0 else ""
-            st.markdown(f"� Стоимость входа: ${entry_value:,.2f}")
-            st.markdown(f"💰 Текущая стоимость позиции ($): ${pos_val:,.2f}{pnl_str}", unsafe_allow_html=True)
+            init0 = float(pos.get('token0_amount_initial') or pos.get('token0_amount') or 0.0)
+            init1 = float(pos.get('token1_amount_initial') or pos.get('token1_amount') or 0.0)
+            if init_price > 0:
+                entry_value = (init0 * init_price + init1)
+                entry_str = f"${entry_value:,.2f}"
+                pnl_usd = (pos_val + pos.get('fees_usd', 0.0)) - entry_value if entry_value > 0 else 0.0
+                pnl_pct = (pnl_usd / entry_value * 100) if entry_value > 0 else 0.0
+                pnl_str = f" <span style='color:{'#2ecc71' if pnl_usd >= 0 else '#e74c3c'}; font-size: 0.9rem; font-weight: bold;'> ({'+' if pnl_usd >= 0 else ''}{pnl_pct:.1f}%)</span>" if entry_value > 0 else ""
+            else:
+                entry_str = "н/д"
+                pnl_str = ""
+            st.markdown(f"Стоимость входа: {entry_str}")
+            st.markdown(f"Текущая стоимость позиции ($): ${pos_val:,.2f}{pnl_str}", unsafe_allow_html=True)
             
         with m3:
             il_color = "normal" if pos['il_percent'] >= -settings_cfg.get('il_warning_percent', 3.0) else "inverse"
@@ -782,13 +793,10 @@ def render_position_card(pos):
             st.metric("Комиссии (всего)", f"{float(pos.get('fees_token0_total') or 0.0):.4g} {base_sym}")
             st.caption(f"+ {float(pos.get('fees_token1_total') or 0.0):,.2f} {quote_sym}")
         with m5:
-            # APR (7д) | APR (все время)
-            apr_7d = f"{pos['weekly_apr']:.1f}%" if pos.get('weekly_apr') is not None else "—"
             apr_raw = pos.get('apr_total')
             apr_total_display = f"{apr_raw:.1f}%" if apr_raw is not None else "—"
             
-            st.metric("APR (7д)", apr_7d)
-            st.caption(f"APR (всe время): {apr_total_display}")
+            st.metric("APR (всё время)", apr_total_display)
         
         # Для кастомных позиций: отображение APY (указанный / фактический)
         if pos.get('apy_text'):
@@ -802,7 +810,7 @@ def render_position_card(pos):
             if target_token and target_amount > 0:
                 curr_target = pos['curr0'] if target_token.upper() == base_sym.upper() else pos['curr1']
                 delta_pct = (curr_target - target_amount) / target_amount * 100 if target_amount > 0 else 0
-                goal_str += f"\\\n{curr_target:.4g} {target_token} → цель {target_amount:.4g} ({delta_pct:+.1f}%)"
+                goal_str += f"  \n{curr_target:.4g} {target_token} → цель {target_amount:.4g} ({delta_pct:+.1f}%)"
             st.markdown(goal_str)
 
             # Кнопки управления статусом для админа

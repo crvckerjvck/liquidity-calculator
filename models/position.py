@@ -16,7 +16,6 @@ class Position:
     fees_token1: float = 0.0
     wallet_address: Optional[str] = None
     last_price: float = 0.0
-    # New goal-tracking fields
     initial_price: float = 0.0
     goal: str = 'maximize_fees'
     target_token: str = ''
@@ -27,6 +26,8 @@ class Position:
     is_public: bool = False
     owner_id: str = "admin"
     status: str = "active"
+    token0_current: float = 0.0
+    token1_current: float = 0.0
 
     @property
     def base_symbol(self) -> str:
@@ -66,6 +67,8 @@ class Position:
             "is_public": self.is_public,
             "owner_id": self.owner_id,
             "status": self.status,
+            "token0_current": self.token0_current,
+            "token1_current": self.token1_current,
         }
 
     @classmethod
@@ -103,4 +106,6 @@ class Position:
             is_public=bool(row['is_public']) if 'is_public' in row.keys() else False,
             owner_id=_s(row['owner_id'] if 'owner_id' in row.keys() else 'admin', 'admin'),
             status=_s(row['status'] if 'status' in row.keys() else 'active', 'active'),
+            token0_current=_f(row['token0_current'] if 'token0_current' in row.keys() else row['token0_amount']),
+            token1_current=_f(row['token1_current'] if 'token1_current' in row.keys() else row['token1_amount']),
         )

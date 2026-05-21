@@ -172,34 +172,56 @@ liquidity_lounge_calculator/
 
 ### 6.1. Точный расчёт IL для Uniswap V3 (концентрированная ликвидность)
 
-Дано:
-- Текущая цена `P_current`
-- Нижняя граница `P_low`, верхняя `P_high`
-- Количество токенов в позиции: `x_real` (актив) и `y_real` (стейбл)
+**Обозначения:**
+- $L$ — ликвидность (инвариант активного диапазона)
+- $P$ — текущая цена, $P_a$ — нижняя граница, $P_b$ — верхняя граница
+- $S = \sqrt{P}$, $S_a = \sqrt{P_a}$, $S_b = \sqrt{P_b}$
+- $x_{real}$ — реальное количество Token0, $y_{real}$ — реальное количество Token1
 
-**Формула (из whitepaper Uniswap V3):**
+**Вывод L из начального депозита ($x_{init}$, $y_{init}$ при $P_{entry}$):**
 
-Если `P_current < P_low`:  
-`x = total_liquidity / sqrt(P_low)`  
-`y = 0`  
-`value = x * P_current`
+Если $P_{entry} < P_a$ (вход ниже диапазона):
+$$L = \frac{x_{init}}{\frac{1}{S_a} - \frac{1}{S_b}}$$
 
-Если `P_current > P_high`:  
-`x = 0`  
-`y = total_liquidity * sqrt(P_high)`  
-`value = y`
+Если $P_{entry} > P_b$ (вход выше диапазона):
+$$L = \frac{y_{init}}{S_b - S_a}$$
 
-Если `P_low <= P_current <= P_high`:  
-`x = total_liquidity * (1/sqrt(P_current) - 1/sqrt(P_high))`  
-`y = total_liquidity * (sqrt(P_current) - sqrt(P_low))`  
-`value = x * P_current + y`
+Если $P_a \le P_{entry} \le P_b$ (вход внутри диапазона):
+$$L = \min\left(\frac{x_{init}}{\frac{1}{S_{entry}} - \frac{1}{S_b}},\; \frac{y_{init}}{S_{entry} - S_a}\right)$$
 
-**IL = (value - hold_value) / hold_value**, где `hold_value` — стоимость изначального депозита, если бы он просто лежал (50/50 в долларах).
+**Расчёт реальных количеств токенов при текущей цене $P$:**
 
-Функция в `il_calculator.py`:
+Если $P < P_a$ (цена ниже диапазона — позиция на 100% в Token0):
+$$x_{real} = L \cdot \frac{S_b - S_a}{S_a \cdot S_b}$$
+$$y_{real} = 0$$
+
+Если $P > P_b$ (цена выше диапазона — позиция на 100% в Token1):
+$$x_{real} = 0$$
+$$y_{real} = L \cdot (S_b - S_a)$$
+
+Если $P_a \le P \le P_b$ (цена внутри диапазона):
+$$x_{real} = L \cdot \frac{S_b - S}{S \cdot S_b}$$
+$$y_{real} = L \cdot (S - S_a)$$
+
+**Стоимость позиции:**
+$$V_{current} = x_{real} \cdot P + y_{real}$$
+
+**Стоимость HODL (если бы токены просто лежали):**
+$$V_{hold} = x_{init} \cdot P + y_{init}$$
+
+**Impermanent Loss:**
+$$IL_{usd} = V_{current} - V_{hold}$$
+$$IL_{\%} = \frac{IL_{usd}}{V_{hold}} \times 100$$
+
+**Важно:**
+- IL отрицателен, когда $V_{current} < V_{hold}$ (цена вне диапазона — позиция терпит убыток относительно HODL).
+- При $P < P_a$: $y_{real} = 0$, $x_{real}$ зафиксирован на максимальном значении для диапазона и НЕ меняется при дальнейшем падении цены.
+- При $P > P_b$: $x_{real} = 0$, $y_{real}$ зафиксирован на максимальном значении.
+
+Функция в `core/il_calculator.py`:
 ```python
-def calculate_il(current_price, lower_price, upper_price, initial_token0, initial_token1):
-    # возвращает il_percent, il_dollar, current_value
+def calculate_il(current_price, lower_price, upper_price, initial_token0, initial_token1, initial_price=None):
+    # возвращает (il_percent, il_dollar, current_value)
 ```
 
 ### 6.2. Историческая волатильность (годовая)

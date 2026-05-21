@@ -40,9 +40,9 @@ def compute_liquidity(
         # Mixed
         denom_x = (1 / sqrt_p - 1 / sqrt_pb)
         denom_y = (sqrt_p - sqrt_pa)
-        L_x = amount0 / denom_x if denom_x > 0 else 0.0
-        L_y = amount1 / denom_y if denom_y > 0 else 0.0
-        return max(L_x, L_y)
+        L_x = amount0 / denom_x if denom_x > 0 else float('inf')
+        L_y = amount1 / denom_y if denom_y > 0 else float('inf')
+        return min(L_x, L_y) if math.isfinite(L_x) or math.isfinite(L_y) else 0.0
 
 
 def compute_current_balances(
