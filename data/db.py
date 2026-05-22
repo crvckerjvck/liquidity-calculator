@@ -95,6 +95,7 @@ def initialize_database():
                 token1_amount REAL DEFAULT 0,
                 reinvested INTEGER DEFAULT 0,
                 logged_at TEXT,
+                delta_liquidity REAL DEFAULT 0,
                 FOREIGN KEY(position_id) REFERENCES positions(id)
             )
         ''')
@@ -338,6 +339,12 @@ def initialize_database():
         except sqlite3.OperationalError:
             pass
 
+        # Миграция: добавить колонку delta_liquidity в fees_log
+        try:
+            cursor.execute("ALTER TABLE fees_log ADD COLUMN delta_liquidity REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
         # Миграция для таблицы auth_tokens
         cursor.execute("SELECT name FROM _migrations WHERE name = 'add_auth_tokens_table'")
         if not cursor.fetchone():
@@ -540,12 +547,14 @@ def update_custom_position_status(pos_id: int, status: str):
 # ─── Fee Logging ─────────────────────────────────────────────────────────────
 
 @retry_db
-def log_fees(pos_id: int, token0_amount: float, token1_amount: float, reinvested: bool = False, new_liquidity: float = 0.0, logged_at: str = None):
+def log_fees(pos_id: int, token0_amount: float, token1_amount: float, reinvested: bool = False,
+             new_liquidity: float = 0.0, logged_at: str = None):
     """
     Записывает новую запись комиссий.
-    Если reinvested=True — прибавляет к базовым token0_amount/token1_amount, обнуляет накопленные.
+    Если reinvested=True — прибавляет ΔL к positions.liquidity, обнуляет накопленные, 
+    сбрасывает token0_current/token1_current в NULL, чтобы compute_v3_balances 
+    всегда считал динамически. Начальные token0_amount/token1_amount не трогает.
     Если reinvested=False — только прибавляет к fees_token0_total/fees_token1_total.
-    Если передан new_liquidity — обновляет его в базе (важно для реинвестирования).
     Если передан logged_at — использует его вместо CURRENT_TIMESTAMP.
     """
     with get_db() as conn:
@@ -554,37 +563,28 @@ def log_fees(pos_id: int, token0_amount: float, token1_amount: float, reinvested
         # Лог
         if logged_at:
             cursor.execute('''
-                INSERT INTO fees_log (position_id, token0_amount, token1_amount, reinvested, logged_at)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (pos_id, token0_amount, token1_amount, 1 if reinvested else 0, logged_at))
+                INSERT INTO fees_log (position_id, token0_amount, token1_amount, reinvested, logged_at, delta_liquidity)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (pos_id, token0_amount, token1_amount, 1 if reinvested else 0, logged_at, new_liquidity))
         else:
             cursor.execute('''
-                INSERT INTO fees_log (position_id, token0_amount, token1_amount, reinvested)
-                VALUES (?, ?, ?, ?)
-            ''', (pos_id, token0_amount, token1_amount, 1 if reinvested else 0))
+                INSERT INTO fees_log (position_id, token0_amount, token1_amount, reinvested, delta_liquidity)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (pos_id, token0_amount, token1_amount, 1 if reinvested else 0, new_liquidity))
 
         if reinvested:
-            update_liquidity_sql = ", liquidity = ?" if new_liquidity > 0 else ""
-            sql = f'''
+            cursor.execute('''
                 UPDATE positions
-                SET token0_amount = token0_amount + ?,
-                    token1_amount = token1_amount + ?,
-                    token0_current = token0_current + ?,
-                    token1_current = token1_current + ?,
-                    fees_token0 = fees_token0 + ?,
-                    fees_token1 = fees_token1 + ?,
+                SET liquidity = liquidity + ?,
+                    fees_token0 = 0,
+                    fees_token1 = 0,
                     fees_token0_total = fees_token0_total + ?,
                     fees_token1_total = fees_token1_total + ?,
+                    token0_current = NULL,
+                    token1_current = NULL,
                     last_updated = CURRENT_TIMESTAMP
-                    {update_liquidity_sql}
                 WHERE id = ?
-            '''
-            params = [token0_amount, token1_amount, token0_amount, token1_amount, token0_amount, token1_amount, token0_amount, token1_amount]
-            if new_liquidity > 0:
-                params.append(new_liquidity)
-            params.append(pos_id)
-            
-            cursor.execute(sql, tuple(params))
+            ''', (new_liquidity, token0_amount, token1_amount, pos_id))
         else:
             cursor.execute('''
                 UPDATE positions
@@ -603,25 +603,26 @@ def delete_fee_log(log_id: int):
     with get_db() as conn:
         cursor = conn.cursor()
         
-        # Получим данные записи для коррекции текущих балансов (reinvested)
-        cursor.execute('SELECT position_id, token0_amount, token1_amount, reinvested FROM fees_log WHERE id = ?', (log_id,))
+        # Получим данные записи для коррекции (reinvested)
+        cursor.execute('SELECT position_id, token0_amount, token1_amount, reinvested, delta_liquidity FROM fees_log WHERE id = ?', (log_id,))
         log = cursor.fetchone()
         if not log:
             return
 
-        pos_id, f0, f1, reinvested = log['position_id'], log['token0_amount'], log['token1_amount'], log['reinvested']
+        pos_id, f0, f1, reinvested, delta_l = log['position_id'], log['token0_amount'], log['token1_amount'], log['reinvested'], log['delta_liquidity']
 
-        if reinvested:
-            # Вычитаем из текущих балансов (реинвестированные суммы были туда добавлены)
+        if reinvested and delta_l:
+            # Откатываем ΔL из ликвидности, сбрасываем current в NULL для динамического пересчёта
             cursor.execute('''
                 UPDATE positions
-                SET token0_amount = MAX(0, token0_amount - ?),
-                    token1_amount = MAX(0, token1_amount - ?),
-                    token0_current = MAX(0, token0_current - ?),
-                    token1_current = MAX(0, token1_current - ?),
+                SET liquidity = MAX(0, liquidity - ?),
+                    fees_token0 = 0,
+                    fees_token1 = 0,
+                    token0_current = NULL,
+                    token1_current = NULL,
                     last_updated = CURRENT_TIMESTAMP
                 WHERE id = ?
-            ''', (f0, f1, f0, f1, pos_id))
+            ''', (float(delta_l), pos_id))
 
         # Удаляем запись
         cursor.execute('DELETE FROM fees_log WHERE id = ?', (log_id,))

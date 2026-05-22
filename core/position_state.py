@@ -42,7 +42,7 @@ def compute_liquidity(
         denom_y = (sqrt_p - sqrt_pa)
         L_x = amount0 / denom_x if denom_x > 0 else float('inf')
         L_y = amount1 / denom_y if denom_y > 0 else float('inf')
-        return min(L_x, L_y) if math.isfinite(L_x) or math.isfinite(L_y) else 0.0
+        return max(L_x, L_y) if math.isfinite(L_x) or math.isfinite(L_y) else 0.0
 
 
 def compute_current_balances(
@@ -150,3 +150,58 @@ def get_composition_at_bounds(liquidity: float, lower_price: float, upper_price:
         "lower": {"token0": token0_at_lower, "token1": token1_at_lower},
         "upper": {"token0": token0_at_upper, "token1": token1_at_upper}
     }
+
+
+def compute_liquidity_delta(
+    current_price: float,
+    lower_price: float,
+    upper_price: float,
+    amount0: float,
+    amount1: float,
+) -> float:
+    """
+    Вычисляет точную ΔL из raw fee deltas (amount0, amount1).
+    Для inside-range кейсов рассчитывает дельту на основе общей USD-стоимости
+    входящих токенов, распределённой в идеальной пропорции пула при текущей цене.
+    Это предотвращает фантомные скачки балансов.
+    """
+    import math
+
+    if lower_price <= 0 or upper_price <= lower_price:
+        return 0.0
+
+    sqrt_pa = math.sqrt(lower_price)
+    sqrt_pb = math.sqrt(upper_price)
+    denom = sqrt_pb - sqrt_pa
+
+    if denom <= 0:
+        return 0.0
+
+    # 1. Цена ниже диапазона (100% Token0)
+    if current_price < lower_price:
+        effective0 = amount0 + (amount1 / current_price if amount1 > 0 else 0.0)
+        return effective0 * sqrt_pa * sqrt_pb / denom if effective0 > 0 else 0.0
+
+    # 2. Цена выше диапазона (100% Token1)
+    elif current_price > upper_price:
+        effective1 = amount1 + (amount0 * current_price if amount0 > 0 else 0.0)
+        return effective1 / denom if effective1 > 0 else 0.0
+
+    # 3. Цена внутри диапазона (пропорциональная смесь)
+    else:
+        sqrt_p = math.sqrt(current_price)
+
+        # Суммарная стоимость реинвестирования в токенах Token1 (USD)
+        total_value = (amount0 * current_price) + amount1
+        if total_value <= 0:
+            return 0.0
+
+        # Количество токенов для ровно 1 единицы ликвидности (L = 1) при текущей цене
+        amount0_per_L = (1.0 / sqrt_p) - (1.0 / sqrt_pb)
+        amount1_per_L = sqrt_p - sqrt_pa
+
+        # Общая стоимость, необходимая для 1 единицы ликвидности
+        value_per_L = (amount0_per_L * current_price) + amount1_per_L
+
+        # Результирующая дельта ликвидности
+        return total_value / value_per_L if value_per_L > 0 else 0.0

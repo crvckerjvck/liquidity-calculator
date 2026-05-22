@@ -21,7 +21,7 @@ from data.db import (
 from data.price_client import get_current_price
 from core.position_state import (
     compute_liquidity, compute_il, range_proximity,
-    get_composition_at_bounds
+    get_composition_at_bounds, compute_liquidity_delta
 )
 from core.il_calculator import calculate_il_v2, compute_v3_balances
 from core.goal_recommendations import get_goal_recommendation, GOAL_LABELS
@@ -116,16 +116,14 @@ def fee_dialog(pos: dict, current_price: float):
         if f0 == 0 and f1 == 0:
             st.warning("Введите хотя бы одно ненулевое значение.")
         else:
-            new_l = 0.0
+            delta_l = 0.0
             if reinvest and current_price > 0:
-                new_a0 = float(pos.get('token0_amount') or 0.0) + f0
-                new_a1 = float(pos.get('token1_amount') or 0.0) + f1
                 lower = float(pos.get('lower_price') or 0.0)
                 upper = float(pos.get('upper_price') or 0.0)
                 if lower < upper:
-                    new_l = compute_liquidity(current_price, lower, upper, new_a0, new_a1)
+                    delta_l = compute_liquidity_delta(current_price, lower, upper, f0, f1)
 
-            log_fees(pos_id, f0, f1, reinvest, new_l, logged_at=fee_date.isoformat())
+            log_fees(pos_id, f0, f1, reinvest, delta_l, logged_at=fee_date.isoformat())
             action = "реинвестированы" if reinvest else "записаны"
             st.success(f"Комиссии {action}! +{f0} {base_sym} / +{f1} {quote_sym}")
             st.rerun()
@@ -208,7 +206,8 @@ def edit_v2_pool_dialog(pos: dict):
         new_goal = st.selectbox("Цель", options=goal_opts, format_func=lambda x: GOAL_LABELS[x], index=current_goal_idx)
         
         new_target_token = st.selectbox("Токен цели", ["", pos['token0_symbol'], pos['token1_symbol']], index=["", pos['token0_symbol'], pos['token1_symbol']].index(pos.get('target_token') or ""))
-        new_target_amount = st.number_input("Целевое количество", value=float(pos.get('target_amount') or 0.0), min_value=0.0, step=1.0)
+        target_label = f"Целевое количество {new_target_token}" if new_target_token else "Целевое количество"
+        new_target_amount = st.number_input(target_label, value=float(pos.get('target_amount') or 0.0), min_value=0.0, step=1.0)
         
         created_at_str = pos.get('created_at', '')
         try:
@@ -796,7 +795,9 @@ def render_position_card(pos):
                 entry_str = "н/д"
                 pnl_str = ""
             st.markdown(f"Стоимость входа: {entry_str}")
-            st.markdown(f"Текущая стоимость позиции ($): ${pos_val:,.2f}{pnl_str}", unsafe_allow_html=True)
+            fee_usd_value = pos.get('fees_usd', 0.0)
+            total_with_fees = pos_val + fee_usd_value
+            st.markdown(f"Текущая стоимость позиции ($): ${total_with_fees:,.2f}{pnl_str}", unsafe_allow_html=True)
             
         with m3:
             il_color = "normal" if pos['il_percent'] >= -settings_cfg.get('il_warning_percent', 3.0) else "inverse"
@@ -820,7 +821,11 @@ def render_position_card(pos):
             goal_lbl  = GOAL_LABELS.get(pos.get('goal', 'maximize_fees'), '—')
             goal_str = f"🎯 **{goal_lbl}**"
             if target_token and target_amount > 0:
-                curr_target = pos['curr0'] if target_token.upper() == base_sym.upper() else pos['curr1']
+                target_token_upper = target_token.upper()
+                if target_token_upper == base_sym.upper():
+                    curr_target = pos.get('curr0', 0.0) or pos.get('token0_amount', 0.0) or pos.get('token0_amount_initial', 0.0)
+                else:
+                    curr_target = pos.get('curr1', 0.0) or pos.get('token1_amount', 0.0) or pos.get('token1_amount_initial', 0.0)
                 delta_pct = (curr_target - target_amount) / target_amount * 100 if target_amount > 0 else 0
                 goal_str += f"  \n{curr_target:.4g} {target_token} → цель {target_amount:.4g} ({delta_pct:+.1f}%)"
             st.markdown(goal_str)
@@ -987,8 +992,8 @@ def render_v2_position_card(pos):
             disp1 = float(pos.get('token1_current') or pos.get('token1_initial', 0.0))
             st.metric("Депозит", f"{disp0:.4g} {pos['token0_symbol']}")
             st.caption(f"+ {disp1:.4g} {pos['token1_symbol']}")
-            # Добавляем общую стоимость позиции
-            total_value = pos['current_value'] # current_value уже содержит IL
+            # Добавляем общую стоимость позиции (пул + накопленные комиссии)
+            total_value = pos['current_value'] + pos.get('fees_usd', 0.0)
             st.markdown(f"💰 **Общая стоимость позиции:** ${total_value:,.2f}")
         with m3:
             st.metric("IL", f"{pos['il_percent']:.2f}%")
