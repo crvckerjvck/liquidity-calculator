@@ -964,7 +964,7 @@ def render_v2_position_card(pos):
             )
         
         with b_col:
-            c1, c2, c3, c4, c5 = st.columns(5)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
             with c1:
                 if st.button("💰", key=f"v2_fee_{pos['id']}", help="Внести комиссии"):
                     v2_fee_dialog(pos)
@@ -981,6 +981,10 @@ def render_v2_position_card(pos):
             with c5:
                 if st.button("✏️", key=f"v2_bal_{pos['id']}", help="Изменить текущие балансы"):
                     edit_v2_balance_dialog(pos)
+            with c6:
+                if st.button("🗑", key=f"v2_del_{pos['id']}", help="Удалить пул"):
+                    hard_delete_v2_pool(pos['id'])
+                    st.rerun()
 
         st.divider()
         m1, m2, m3, m4 = st.columns(4)
