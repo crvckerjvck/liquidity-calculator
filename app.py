@@ -14,7 +14,9 @@ from data.db import (
     get_v2_pools, get_public_v2_pools, get_public_custom_positions,
     update_position_current_balances,
     update_v2_pool, soft_delete_v2_pool, hard_delete_v2_pool,
-    log_v2_fees, get_v2_fees_log, clear_all_v2_fees
+    log_v2_fees, get_v2_fees_log, clear_all_v2_fees,
+    update_v2_pool_status, update_custom_position_status,
+    update_v2_pool_balances
 )
 from data.price_client import get_current_price
 from core.position_state import (
@@ -176,12 +178,17 @@ def edit_custom_position_dialog(cpos: dict):
                 'amount_deposited': new_dep,
                 'apy': new_apy,
                 'notes': new_notes,
-                'is_public': int(new_is_public)
+                'is_public': int(new_is_public),
             }
             if cpos['type'] == 'lending':
                 update_kwargs['amount_borrowed'] = new_borrow
                 update_kwargs['liquidation_threshold'] = new_thresh
-                
+
+            # Синхронизируем initial_body_usd/current_body_usd с депозитом
+            if new_dep != float(cpos['amount_deposited']):
+                update_kwargs['initial_body_usd'] = new_dep
+                update_kwargs['current_body_usd'] = new_dep
+
             update_custom_position(cpos['id'], **update_kwargs)
             st.rerun()
 
@@ -331,8 +338,11 @@ def edit_date_dialog(pos: dict):
 def update_custom_body_dialog(cpos: dict):
     pos_id = cpos['id']
     current_body = float(cpos.get('current_body_usd') or 0.0)
+    initial_body = float(cpos.get('initial_body_usd') or 0.0)
+    total_fees = float(cpos.get('total_fees_usd') or 0.0)
     
     st.markdown(f"**{cpos.get('asset_deposited', '—')}** ({cpos.get('type', '—')})")
+    st.caption(f"Начальный депозит: ${initial_body:,.2f} | Накопленные комиссии: ${total_fees:,.2f}")
     new_body = st.number_input("Текущее тело депозита (USD)", value=current_body, min_value=0.0, step=10.0, format="%.2f")
     
     if st.button("💾 Сохранить"):
@@ -355,8 +365,11 @@ def custom_visibility_dialog(cpos: dict):
 def custom_fee_dialog(cpos: dict):
     pos_id = cpos['id']
     total_fees = float(cpos.get('total_fees_usd') or 0.0)
+    current_body = float(cpos.get('current_body_usd') or 0.0)
+    initial_body = float(cpos.get('initial_body_usd') or 0.0)
     
     st.markdown(f"**{cpos.get('asset_deposited', '—')}** ({cpos.get('type', '—')})")
+    st.caption(f"Начальный депозит: ${initial_body:,.2f} | Текущее тело: ${current_body:,.2f}")
     st.caption(f"Текущие накопленные комиссии: **${total_fees:,.2f}**")
     
     additional_fee = st.number_input("Сумма комиссий (USD)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
@@ -624,35 +637,34 @@ for raw in v2_raw:
     pos = dict(raw)
     price0 = get_current_price(pos['token0_symbol'], pos['network']) or 0.0
     price1 = get_current_price(pos['token1_symbol'], pos['network']) or 0.0
-    
-    # Расчет текущей стоимости пула: 
-    # В V2 50/50: общая стоимость пула может быть рассчитана как 2 * token0_current * price0
-    # Но для упрощения (так как мы не моделируем точный баланс пула после свапов без API)
-    # мы просто применим IL к начальной стоимости.
-    initial_val = pos['token0_initial'] * pos['initial_price'] + pos['token1_initial']
-    
+
+    # Текущие количества для отображения (ручная корректировка или начальные)
+    curr0 = float(pos.get('token0_current') or pos['token0_initial'])
+    curr1 = float(pos.get('token1_current') or pos['token1_initial'])
+
+    # IL рассчитывается строго на начальных количествах (не зависит от ручных правок)
+    hold_value = pos['token0_initial'] * price0 + pos['token1_initial'] * price1
     current_price_ratio = price0 / price1 if price1 > 0 else 0.0
     il_percent = calculate_il_v2(pos['initial_price'], current_price_ratio) if current_price_ratio > 0 else 0.0
-    
-    # Hold value:
-    hold_value = pos['token0_initial'] * price0 + pos['token1_initial'] * price1
-    pos_val = hold_value * (1 + il_percent/100) if hold_value > 0 else 0.0
-    
+
+    # Текущая стоимость на основе актуальных балансов (с учётом ручной корректировки)
+    pos_val = curr0 * price0 + curr1 * price1
+
     pos['current_value'] = pos_val
     pos['il_percent'] = il_percent
-    pos['il_usd'] = pos_val - hold_value
+    pos['il_usd'] = hold_value * (il_percent / 100) if il_percent != 0 else 0.0
     pos['price0'] = price0
     pos['price1'] = price1
-    pos['entry_usd'] = initial_val
-    
+    pos['entry_usd'] = pos['token0_initial'] * pos['initial_price'] + pos['token1_initial']
+
     fees0 = float(pos.get('fees_token0_total') or 0.0)
     fees1 = float(pos.get('fees_token1_total') or 0.0)
     fees_usd = fees0 * price0 + fees1 * price1
     pos['fees_usd'] = fees_usd
-    
+
     total_value += pos_val
     total_fees_usd += fees_usd
-    
+
     v2_enriched.append(pos)
 
 # ─── Sidebar summary ─────────────────────────────────────────────────────────
@@ -905,6 +917,17 @@ def v2_visibility_dialog(pos: dict):
         update_v2_pool_visibility(pos['id'], int(new_val))
         st.rerun()
 
+
+@st.dialog("✏️ Изменить текущие балансы V2 пула")
+def edit_v2_balance_dialog(pos: dict):
+    curr0 = float(pos.get('token0_current') or pos['token0_initial'])
+    curr1 = float(pos.get('token1_current') or pos['token1_initial'])
+    new0 = st.number_input(f"Текущее количество {pos['token0_symbol']}", value=curr0, min_value=0.0, format="%.8f")
+    new1 = st.number_input(f"Текущее количество {pos['token1_symbol']}", value=curr1, min_value=0.0, format="%.2f")
+    if st.button("Сохранить"):
+        update_v2_pool_balances(pos['id'], new0, new1)
+        st.rerun()
+
 def render_v2_position_card(pos):
     pair = pos['pair']
     with st.container(border=True):
@@ -936,7 +959,7 @@ def render_v2_position_card(pos):
             )
         
         with b_col:
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             with c1:
                 if st.button("💰", key=f"v2_fee_{pos['id']}", help="Внести комиссии"):
                     v2_fee_dialog(pos)
@@ -950,6 +973,9 @@ def render_v2_position_card(pos):
                 if st.button("🔒", key=f"v2_close_{pos['id']}", help="Закрыть пул"):
                     soft_delete_v2_pool(pos['id'])
                     st.rerun()
+            with c5:
+                if st.button("✏️", key=f"v2_bal_{pos['id']}", help="Изменить текущие балансы"):
+                    edit_v2_balance_dialog(pos)
 
         st.divider()
         m1, m2, m3, m4 = st.columns(4)
@@ -957,8 +983,13 @@ def render_v2_position_card(pos):
             st.metric("Price 0 / Price 1 (текущая цена)", f"{pos['price0']/pos['price1']:.4g}" if pos['price1'] > 0 else "—")
             st.caption(f"Цена входа: {pos['initial_price']:.4g}")
         with m2:
-            st.metric("Депозит", f"{pos['token0_initial']:.4g} {pos['token0_symbol']}")
-            st.caption(f"+ {pos['token1_initial']:.4g} {pos['token1_symbol']}")
+            disp0 = float(pos.get('token0_current') or pos.get('token0_initial', 0.0))
+            disp1 = float(pos.get('token1_current') or pos.get('token1_initial', 0.0))
+            st.metric("Депозит", f"{disp0:.4g} {pos['token0_symbol']}")
+            st.caption(f"+ {disp1:.4g} {pos['token1_symbol']}")
+            # Добавляем общую стоимость позиции
+            total_value = pos['current_value'] # current_value уже содержит IL
+            st.markdown(f"💰 **Общая стоимость позиции:** ${total_value:,.2f}")
         with m3:
             st.metric("IL", f"{pos['il_percent']:.2f}%")
         with m4:
@@ -973,14 +1004,20 @@ def render_custom_position_card(cpos):
     asset_dep = cpos['asset_deposited']
     amount_dep = cpos['amount_deposited']
     val_dep = cpos['val_dep']
-    
+
+    current_body = float(cpos.get('current_body_usd') or 0.0)
+    total_fees = float(cpos.get('total_fees_usd') or 0.0)
+    initial_body = float(cpos.get('initial_body_usd') or 0.0)
+    actual_apy = cpos.get('actual_apy')
+    stated_apy = cpos.get('apy')
+
     # Icons per type
     icons = {
-        "lending": "🏦", "v2_pool": "🌊", "vault": "📦", 
+        "lending": "🏦", "v2_pool": "🌊", "vault": "📦",
         "staking": "🥩", "perp_vault": "📉", "delta_neutral": "⚖️"
     }
     icon = icons.get(cpos['type'], "💰")
-    
+
     with st.container(border=True):
         col_h, col_b = st.columns([4, 2])
         with col_h:
@@ -994,11 +1031,19 @@ def render_custom_position_card(cpos):
                 f"<div style='display: flex; align-items: center;'>"
                 f"<h3 style='margin:0;'>{icon} {protocol}{pub_badge_custom} &nbsp;"
                 f"<span style='font-size:0.75rem;color:#888;'>{network} · {ctype}</span>"
-                f"</h3></div>", 
+                f"</h3></div>",
                 unsafe_allow_html=True
             )
             st.markdown(f"**Депозит:** {amount_dep:,.4f} {asset_dep} (${val_dep:,.2f})")
-            
+        created_str = cpos.get('created_at', '')
+        if created_str:
+            try:
+                created_short = created_str[:10]
+            except (ValueError, TypeError):
+                created_short = ''
+            if created_short:
+                st.caption(f"📅 Открыта: {created_short}")
+
         with col_b:
             if st.session_state.authenticated:
                 c1, c2, c3, c4 = st.columns(4)
@@ -1017,6 +1062,24 @@ def render_custom_position_card(cpos):
                         hard_delete_custom_position(cpos['id'])
                         st.rerun()
 
+        st.divider()
+        metrics_cols = st.columns(4)
+        with metrics_cols[0]:
+            st.metric("Начальный депозит", f"${initial_body:,.2f}" if initial_body else "—")
+        with metrics_cols[1]:
+            st.metric("Текущее тело", f"${current_body:,.2f}" if current_body else "—")
+        with metrics_cols[2]:
+            st.metric("Накопленные комиссии", f"${total_fees:,.2f}")
+        with metrics_cols[3]:
+            pnl = (current_body + total_fees - initial_body) if initial_body > 0 else 0.0
+            pnl_pct = (pnl / initial_body * 100) if initial_body > 0 else 0.0
+            pnl_color = "#2ecc71" if pnl >= 0 else "#e74c3c"
+            st.markdown(
+                f"<span style='font-size:0.85rem;color:#888;'>PnL</span><br>"
+                f"<span style='font-size:1.1rem;font-weight:600;color:{pnl_color};'>${pnl:+,.2f} ({pnl_pct:+.1f}%)</span>",
+                unsafe_allow_html=True
+            )
+
         if cpos['type'] == 'lending':
             st.divider()
             m1, m2, m3, m4 = st.columns(4)
@@ -1027,24 +1090,28 @@ def render_custom_position_card(cpos):
             with m3:
                 hf = cpos.get('health_factor')
                 if hf:
-                    if hf < 1.0: 
+                    if hf < 1.0:
                         hf_str = f"**Health Factor**<br><span style='color:#e74c3c'>{hf:.2f} 🔴</span>"
-                    elif hf < 1.5: 
+                    elif hf < 1.5:
                         hf_str = f"**Health Factor**<br><span style='color:#f39c12'>{hf:.2f} 🟡</span>"
                     elif hf > 10:
                         hf_str = f"**Health Factor**<br><span style='color:#2ecc71'>>10 🟢</span>"
-                    else: 
+                    else:
                         hf_str = f"**Health Factor**<br><span style='color:#2ecc71'>{hf:.2f} 🟢</span>"
                     st.markdown(hf_str, unsafe_allow_html=True)
-            with m4:
-                st.markdown(f"**APY**<br>{cpos['apy']}%" if cpos['apy'] else "**APY**<br>—", unsafe_allow_html=True)
-        else:
-            if cpos.get('apy'):
-                st.metric("APY", f"{cpos['apy']}%")
-        
+
+        apy_parts = []
+        if actual_apy is not None:
+            apy_color = "#2ecc71" if actual_apy >= 0 else "#e74c3c"
+            apy_parts.append(f"<span style='color:{apy_color};font-weight:600;'>APY (факт): {actual_apy:.1f}%</span>")
+        if stated_apy:
+            apy_parts.append(f"APY (указ): {stated_apy:.1f}%")
+        if apy_parts:
+            st.markdown(" | ".join(apy_parts), unsafe_allow_html=True)
+
         if cpos.get('notes'):
             st.caption(f"📝 {cpos['notes']}")
-        
+
         if st.session_state.authenticated:
             col_a, col_b = st.columns(2)
             with col_a:
@@ -1102,6 +1169,58 @@ if private_custom and st.session_state.authenticated:
     st.subheader("🔐 Мои личные DeFi-позиции")
     for cpos in private_custom:
         render_custom_position_card(cpos)
+
+# ─── Closed Positions Section ────────────────────────────────────────────────
+closed_v3 = [pos for pos in positions_enriched if pos.get('status') == 'closed']
+if not closed_v3:
+    all_raw = get_all_positions()
+    closed_v3 = [dict(r) for r in all_raw if 'status' in r.keys() and r['status'] == 'closed']
+
+closed_v2_raw = get_v2_pools(status_filter='closed')
+closed_v2 = [dict(r) for r in closed_v2_raw]
+
+closed_custom_raw = get_custom_positions(status_filter='closed')
+closed_custom = [dict(r) for r in closed_custom_raw]
+
+if closed_v3 or closed_v2 or closed_custom:
+    if public_custom or private_custom:
+        st.divider()
+    st.subheader("🔒 Закрытые позиции")
+
+    for pos in closed_v3:
+        pair = pos.get('pair', '—')
+        network = pos.get('network', '')
+        dex = pos.get('dex', '')
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.markdown(f"**{pair}** — {network.upper()} · {dex} (V3)")
+        with col2:
+            if st.button("Открыть снова", key=f"open_v3_{pos['id']}"):
+                update_position_status(pos['id'], 'active')
+                st.rerun()
+
+    for pos in closed_v2:
+        pair = pos.get('pair', '—')
+        network = pos.get('network', '')
+        dex = pos.get('dex', '')
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.markdown(f"**{pair}** — {network.upper()} · {dex} (V2)")
+        with col2:
+            if st.button("Открыть снова", key=f"open_v2_{pos['id']}"):
+                update_v2_pool_status(pos['id'], 'active')
+                st.rerun()
+
+    for cpos in closed_custom:
+        protocol = cpos.get('protocol', '—')
+        ctype = cpos.get('type', '')
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.markdown(f"**{protocol}** · {ctype}")
+        with col2:
+            if st.button("Открыть снова", key=f"open_custom_{cpos['id']}"):
+                update_custom_position_status(cpos['id'], 'active')
+                st.rerun()
 
 # ─── Footer ───────────────────────────────────────────────────────────────────
 st.divider()

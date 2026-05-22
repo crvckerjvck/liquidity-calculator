@@ -4,7 +4,7 @@ import math
 import secrets
 import time
 import functools
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 from models.position import Position
 
@@ -117,7 +117,9 @@ def initialize_database():
                 closed_at TEXT,
                 initial_body_usd REAL DEFAULT 0,
                 current_body_usd REAL DEFAULT 0,
-                total_fees_usd REAL DEFAULT 0
+                total_fees_usd REAL DEFAULT 0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                actual_apy REAL DEFAULT NULL
             )
         ''')
         
@@ -140,7 +142,9 @@ def initialize_database():
                 target_token TEXT,
                 target_amount REAL,
                 apy REAL,
-                closed_at TEXT
+                closed_at TEXT,
+                token0_current REAL DEFAULT NULL,
+                token1_current REAL DEFAULT NULL
             )
         ''')
         
@@ -202,6 +206,16 @@ def initialize_database():
         # Миграция для колонки is_public в v2_pools
         try:
             cursor.execute("ALTER TABLE v2_pools ADD COLUMN is_public INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # Уже существует
+        
+        # Миграция для колонок token0_current, token1_current в v2_pools
+        try:
+            cursor.execute("ALTER TABLE v2_pools ADD COLUMN token0_current REAL DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # Уже существует
+        try:
+            cursor.execute("ALTER TABLE v2_pools ADD COLUMN token1_current REAL DEFAULT NULL")
         except sqlite3.OperationalError:
             pass  # Уже существует
 
@@ -286,6 +300,43 @@ def initialize_database():
         if not cursor.fetchone():
             cursor.execute("UPDATE custom_positions SET initial_body_usd = amount_deposited, current_body_usd = amount_deposited WHERE initial_body_usd = 0")
             cursor.execute("INSERT INTO _migrations (name) VALUES ('add_custom_apy_columns')")
+
+        # Миграция: добавить колонку last_updated в custom_positions
+        try:
+            cursor.execute("ALTER TABLE custom_positions ADD COLUMN last_updated TIMESTAMP")
+        except sqlite3.OperationalError:
+            pass  # Уже существует
+
+        # Миграция: добавить колонку actual_apy в custom_positions
+        try:
+            cursor.execute("ALTER TABLE custom_positions ADD COLUMN actual_apy REAL DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # Уже существует
+
+        # Миграция: пересчитать actual_apy для существующих кастомных позиций
+        cursor.execute("SELECT name FROM _migrations WHERE name = 'recalc_actual_apy'")
+        if not cursor.fetchone():
+            cursor.execute("SELECT id, initial_body_usd, current_body_usd, total_fees_usd, created_at FROM custom_positions WHERE initial_body_usd > 0 AND created_at IS NOT NULL")
+            rows = cursor.fetchall()
+            for row in rows:
+                pos_id = row['id']
+                initial = float(row['initial_body_usd'] or 0.0)
+                current = float(row['current_body_usd'] or 0.0)
+                fees = float(row['total_fees_usd'] or 0.0)
+                created_at = row['created_at']
+                calc_apy = _recalc_actual_apy(initial, current, fees, created_at)
+                if calc_apy is not None:
+                    cursor.execute("UPDATE custom_positions SET actual_apy = ? WHERE id = ?", (calc_apy, pos_id))
+            cursor.execute("INSERT INTO _migrations (name) VALUES ('recalc_actual_apy')")
+
+        # Миграция: заполнить initial_body_usd/current_body_usd для позиций, где они равны 0
+        try:
+            cursor.execute("SELECT id FROM custom_positions WHERE (initial_body_usd IS NULL OR initial_body_usd = 0) AND amount_deposited > 0")
+            rows = cursor.fetchall()
+            for row in rows:
+                cursor.execute("UPDATE custom_positions SET initial_body_usd = amount_deposited, current_body_usd = amount_deposited WHERE id = ?", (row['id'],))
+        except sqlite3.OperationalError:
+            pass
 
         # Миграция для таблицы auth_tokens
         cursor.execute("SELECT name FROM _migrations WHERE name = 'add_auth_tokens_table'")
@@ -453,6 +504,39 @@ def update_position_current_balances(pos_id: int, token0_current: float, token1_
         )
 
 
+@retry_db
+def update_v2_pool_status(pool_id: int, status: str):
+    """Обновляет статус V2 пула."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE v2_pools SET status = ? WHERE id = ?',
+            (status, pool_id)
+        )
+
+
+@retry_db
+def update_v2_pool_balances(pool_id: int, token0_current: float, token1_current: float):
+    """Обновляет текущие балансы V2 пула (ручная корректировка тела депозита)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE v2_pools SET token0_current = ?, token1_current = ? WHERE id = ?',
+            (token0_current, token1_current, pool_id)
+        )
+
+
+@retry_db
+def update_custom_position_status(pos_id: int, status: str):
+    """Обновляет статус кастомной позиции."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE custom_positions SET status = ? WHERE id = ?',
+            (status, pos_id)
+        )
+
+
 # ─── Fee Logging ─────────────────────────────────────────────────────────────
 
 @retry_db
@@ -615,12 +699,14 @@ def add_custom_position(
             INSERT INTO custom_positions (
                 type, protocol, network, asset_deposited, amount_deposited,
                 asset_borrowed, amount_borrowed, liquidation_threshold, apy,
-                status, created_at, notes, is_public
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, created_at, notes, is_public,
+                initial_body_usd, current_body_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             type, protocol, network, asset_deposited, amount_deposited,
             asset_borrowed, amount_borrowed, liquidation_threshold, apy,
-            'active', created_at, notes, int(is_public)
+            'active', created_at, notes, int(is_public),
+            amount_deposited, amount_deposited
         ))
 
 
@@ -659,22 +745,70 @@ def hard_delete_custom_position(pos_id: int):
         cursor.execute('DELETE FROM custom_positions WHERE id = ?', (pos_id,))
 
 
+def _recalc_actual_apy(initial_body: float, current_body: float, total_fees: float, created_at: str) -> float | None:
+    """Рассчитывает фактический APY для кастомной позиции."""
+    if initial_body <= 0 or not created_at:
+        return None
+    try:
+        created_date = datetime.strptime(created_at[:10], '%Y-%m-%d').date()
+        days_active = (date.today() - created_date).days
+    except (ValueError, TypeError):
+        days_active = 0
+    if days_active < 1:
+        return None
+    total_gain = (current_body - initial_body) + total_fees
+    calc_apy = (total_gain / initial_body) * (365.0 / days_active) * 100.0
+    return max(-100.0, min(500.0, calc_apy))
+
+
 @retry_db
 def update_custom_body(pos_id: int, current_body_usd: float):
-    """Обновляет текущее тело депозита кастомной позиции."""
+    """Обновляет текущее тело депозита кастомной позиции и пересчитывает фактический APY."""
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute('UPDATE custom_positions SET current_body_usd = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?',
-                       (current_body_usd, pos_id))
+        cursor.execute(
+            "SELECT initial_body_usd, total_fees_usd, created_at FROM custom_positions WHERE id = ?",
+            (pos_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return
+
+        initial_body = float(row['initial_body_usd'] or 0.0)
+        total_fees = float(row['total_fees_usd'] or 0.0)
+        created_at = row['created_at']
+
+        actual_apy = _recalc_actual_apy(initial_body, current_body_usd, total_fees, created_at)
+
+        cursor.execute(
+            'UPDATE custom_positions SET current_body_usd = ?, last_updated = CURRENT_TIMESTAMP, actual_apy = ? WHERE id = ?',
+            (current_body_usd, actual_apy, pos_id)
+        )
 
 
 @retry_db
 def update_custom_fees(pos_id: int, total_fees_usd: float):
-    """Обновляет накопленные комиссии кастомной позиции."""
+    """Обновляет накопленные комиссии кастомной позиции и пересчитывает фактический APY."""
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute('UPDATE custom_positions SET total_fees_usd = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?',
-                       (total_fees_usd, pos_id))
+        cursor.execute(
+            "SELECT initial_body_usd, current_body_usd, created_at FROM custom_positions WHERE id = ?",
+            (pos_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return
+
+        initial_body = float(row['initial_body_usd'] or 0.0)
+        current_body = float(row['current_body_usd'] or 0.0)
+        created_at = row['created_at']
+
+        actual_apy = _recalc_actual_apy(initial_body, current_body, total_fees_usd, created_at)
+
+        cursor.execute(
+            'UPDATE custom_positions SET total_fees_usd = ?, last_updated = CURRENT_TIMESTAMP, actual_apy = ? WHERE id = ?',
+            (total_fees_usd, actual_apy, pos_id)
+        )
 
 
 # ─── V2 Pools CRUD ───────────────────────────────────────────────────────────
@@ -695,12 +829,14 @@ def add_v2_pool(
             INSERT INTO v2_pools (
                 network, dex, pair, token0_symbol, token1_symbol,
                 token0_initial, token1_initial, initial_price,
-                created_at, apy, goal, target_token, target_amount, status, is_public
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, apy, goal, target_token, target_amount, status, is_public,
+                token0_current, token1_current
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             network, dex, pair, token0_symbol, token1_symbol,
             token0_initial, token1_initial, initial_price,
-            created_at, apy, goal, target_token, target_amount, 'active', int(is_public)
+            created_at, apy, goal, target_token, target_amount, 'active', int(is_public),
+            token0_initial, token1_initial
         ))
 
 def get_v2_pools(status_filter: str = None) -> list:

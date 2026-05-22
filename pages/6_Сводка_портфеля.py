@@ -1,8 +1,23 @@
 import streamlit as st
 import pandas as pd
+from datetime import datetime
 from data.db import get_all_positions, get_v2_pools, get_custom_positions, get_public_v2_pools, get_public_custom_positions
 from data.price_client import get_current_price
 from core.il_calculator import calculate_il_v2
+
+
+def _calc_apr(entry_usd: float, fees_usd: float, created_at: str) -> float | None:
+    """Рассчитывает APR за всё время. Возвращает float или None если нельзя рассчитать."""
+    if entry_usd <= 0 or fees_usd <= 0:
+        return None
+    try:
+        created = datetime.fromisoformat(created_at)
+        days = (datetime.now() - created).days
+        if days < 1:
+            return None
+        return (fees_usd / entry_usd) * (365.0 / days) * 100.0
+    except (ValueError, TypeError):
+        return None
 
 # Page config
 st.set_page_config(page_title="Сводка портфеля", page_icon="📋", layout="wide")
@@ -59,6 +74,8 @@ for pos in raw_positions:
     fees0 = float(pos['fees_token0_total'] or 0.0)
     fees1 = float(pos['fees_token1_total'] or 0.0)
     fees_usd = fees0 * price + fees1
+
+    apr_val = _calc_apr(entry_usd, fees_usd, pos['created_at'] if 'created_at' in pos.keys() else '')
     
     pnl = current_value + fees_usd - entry_usd if entry_usd > 0 else 0.0
     pnl_pct = (pnl / entry_usd * 100) if entry_usd > 0 else 0.0
@@ -72,6 +89,7 @@ for pos in raw_positions:
         "Комиссии ($)": fees_usd,
         "PnL ($)": pnl,
         "PnL (%)": pnl_pct,
+        "APR (%)": apr_val,
         "Статус": "🟢 Активная" if pos['status'] != 'closed' else "⚫ Закрыта",
         "ID": f"v3_{pos['id']}"
     })
@@ -102,6 +120,8 @@ for pos in v2_pools_raw:
     fees1 = float(pos['fees_token1_total'] or 0.0)
     fees_usd = fees0 * price0 + fees1 * price1
 
+    apr_val = _calc_apr(entry_usd, fees_usd, pos['created_at'] if 'created_at' in pos.keys() else '')
+
     pnl = current_value + fees_usd - entry_usd if entry_usd > 0 else 0.0
     pnl_pct = (pnl / entry_usd * 100) if entry_usd > 0 else 0.0
     
@@ -114,6 +134,7 @@ for pos in v2_pools_raw:
         "Комиссии ($)": fees_usd,
         "PnL ($)": pnl,
         "PnL (%)": pnl_pct,
+        "APR (%)": apr_val,
         "Статус": "🟢 Активная" if pos['status'] != 'closed' else "⚫ Закрыта",
         "ID": f"v2_{pos['id']}"
     })
@@ -129,35 +150,53 @@ for cpos in custom_raw:
         if (status_filter == "Активные" and cpos['status'] == 'closed') or \
            (status_filter == "Закрытые" and cpos['status'] != 'closed'):
             continue
-            
-    price_dep = get_current_price(cpos['asset_deposited'], cpos['network']) or 0.0
-    val_dep = cpos['amount_deposited'] * price_dep
-    
+
     ctype = cpos['type'].replace("_", " ").title()
-    entry_usd = val_dep
-    pnl = 0.0
-    pnl_pct = 0.0
-    
+    initial_body = float(cpos['initial_body_usd'] or 0.0)
+    current_body = float(cpos['current_body_usd'] or 0.0)
+    total_fees_usd = float(cpos['total_fees_usd'] or 0.0)
+
+    entry_usd = initial_body if initial_body > 0 else current_body
+    cur_val = current_body
+
+    apr_val = None
+    if cpos['type'] != 'lending':
+        raw_apy = cpos['actual_apy'] if 'actual_apy' in cpos.keys() else None
+        if raw_apy is not None:
+            try:
+                apr_val = float(raw_apy)
+            except (ValueError, TypeError):
+                apr_val = None
+
+    pnl = current_body + total_fees_usd - initial_body if initial_body > 0 else 0.0
+    pnl_pct = (pnl / initial_body * 100) if initial_body > 0 else 0.0
+
     summary_data.append({
         "Тип": ctype,
         "Протокол / Пара": f"{cpos['protocol']} {cpos['asset_deposited']}",
         "Сеть": cpos['network'].capitalize(),
         "Вход ($)": entry_usd,
-        "Текущая ($)": val_dep,
-        "Комиссии ($)": 0.0,
+        "Текущая ($)": cur_val,
+        "Комиссии ($)": total_fees_usd,
         "PnL ($)": pnl,
         "PnL (%)": pnl_pct,
+        "APR (%)": apr_val,
         "Статус": "🟢 Активная" if cpos['status'] != 'closed' else "⚫ Закрыта",
         "ID": f"custom_{cpos['id']}"
     })
     if cpos['status'] != 'closed':
-        total_current_value += val_dep
+        total_current_value += cur_val
 
 # --- Render ---
 if summary_data:
     df = pd.DataFrame(summary_data)
-    cols = ["Тип", "Протокол / Пара", "Сеть", "Вход ($)", "Текущая ($)", "Комиссии ($)", "PnL ($)", "PnL (%)", "Статус"]
+    cols = ["Тип", "Протокол / Пара", "Сеть", "Вход ($)", "Текущая ($)", "Комиссии ($)", "PnL ($)", "PnL (%)", "APR (%)", "Статус"]
     df = df[cols]
+    
+    def _fmt_apr(val):
+        if val is None:
+            return "—"
+        return f"{val:.1f}%"
     
     st.dataframe(
         df.style.format({
@@ -165,7 +204,8 @@ if summary_data:
             "Текущая ($)": "${:,.2f}",
             "Комиссии ($)": "${:,.2f}",
             "PnL ($)": "${:,.2f}",
-            "PnL (%)": "{:,.2f}%"
+            "PnL (%)": "{:,.2f}%",
+            "APR (%)": _fmt_apr
         }).apply(
             lambda row: [
                 ('color: #2ecc71;' if row['PnL ($)'] > 0 else 'color: #e74c3c;' if row['PnL ($)'] < 0 else '') if pd.notna(row['PnL ($)']) else '',
