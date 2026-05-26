@@ -6,3 +6,4 @@ __pycache__/
 .streamlit/secrets.toml
 data/pools_cache/
 *.log
+.env
