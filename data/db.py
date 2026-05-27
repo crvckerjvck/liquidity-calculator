@@ -8,46 +8,58 @@ from typing import Optional
 
 import streamlit as st
 from dotenv import load_dotenv
-from postgrest._sync.client import SyncPostgrestClient as PostgrestClient
+import httpx
+from supabase import create_client, Client
 
-from models.position import Position
+load_dotenv()
 
-_DB_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.abspath(os.path.join(_DB_DIR, '..'))
-load_dotenv(os.path.join(_PROJECT_ROOT, '.env'))
+SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
-SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY") or st.secrets.get("SUPABASE_SECRET_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Supabase credentials missing!")
+    st.stop()
 
-if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
-    raise RuntimeError(
-        "SUPABASE_URL and SUPABASE_SECRET_KEY must be set. "
-        "Add them to .env file, environment variables, or Streamlit secrets."
-    )
 
-_api_url = SUPABASE_URL.rstrip('/') + '/rest/v1'
-supabase = PostgrestClient(
-    base_url=_api_url,
-    headers={
-        "apikey": SUPABASE_SECRET_KEY,
-        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}"
+def _make_client(url: str, key: str) -> Client:
+    """Creates a standard Supabase Client supporting both JWT and sb_secret_* keys."""
+    dummy_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSJ9.fake_signature"
+    client = create_client(url, dummy_jwt)
+    real_headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}"
     }
-)
+    client.postgrest.auth(key)
+    if hasattr(client.postgrest, "session") and client.postgrest.session:
+        client.postgrest.session.headers.update(real_headers)
+        transport = httpx.HTTPTransport(retries=3)
+        client.postgrest.session._transport = transport
+    return client
+
+
+supabase = _make_client(SUPABASE_URL, SUPABASE_KEY)
+
+_CURRENT_OWNER = os.getenv("APP_OWNER_ID") or st.secrets.get("APP_OWNER_ID") or "user1"
+
 
 def _now():
     return datetime.now().isoformat()
 
+
 def supabase_db_retry(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        last_error = None
         for attempt in range(3):
             try:
                 return func(*args, **kwargs)
             except Exception as e:
                 print(f"Supabase error (attempt {attempt + 1}): {e}")
+                last_error = e
                 time.sleep(1 * (attempt + 1))
-        raise
+        raise last_error
     return wrapper
+
 
 @supabase_db_retry
 def initialize_database():
@@ -56,6 +68,13 @@ def initialize_database():
     except Exception as e:
         print(f"Supabase connection check failed: {e}")
         raise
+
+
+def _owner_filter(query, owner_id: str = None):
+    if owner_id is None:
+        owner_id = _CURRENT_OWNER
+    return query.eq("owner_id", owner_id)
+
 
 # ─── Position CRUD ───────────────────────────────────────────────────────────
 
@@ -71,10 +90,11 @@ def add_position(
     target_amount: float = 0.0,
     liquidity: float = 0.0,
     is_public: bool = False,
-    owner_id: str = "admin",
+    owner_id: str = None,
     status: str = "active",
     created_at: str = None,
 ):
+    actual_owner = owner_id if owner_id else _CURRENT_OWNER
     data = {
         "network": network,
         "dex": dex,
@@ -94,7 +114,7 @@ def add_position(
         "fees_token1_total": fees_token1,
         "liquidity": liquidity,
         "is_public": int(is_public),
-        "owner_id": owner_id,
+        "owner_id": actual_owner,
         "status": status,
         "created_at": created_at,
         "token0_amount_initial": token0_amount,
@@ -105,8 +125,9 @@ def add_position(
     supabase.table("positions").insert(data).execute()
 
 
-def get_all_positions():
-    result = supabase.table("positions").select("*").order("created_at", desc=True).execute()
+def get_all_positions(owner_id: str = None) -> list:
+    query = _owner_filter(supabase.table("positions").select("*"), owner_id).order("created_at", desc=True)
+    result = query.execute()
     return result.data
 
 
@@ -126,12 +147,12 @@ def update_position_price(pos_id: int, price: float):
     supabase.table("positions").update({
         "last_price": price,
         "last_updated": _now()
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 def delete_position(pos_id: int):
     supabase.table("fees_log").delete().eq("position_id", pos_id).execute()
-    supabase.table("positions").delete().eq("id", pos_id).execute()
+    supabase.table("positions").delete().eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 def update_position_goal(pos_id: int, goal: str, target_token: str, target_amount: float):
@@ -140,7 +161,7 @@ def update_position_goal(pos_id: int, goal: str, target_token: str, target_amoun
         "target_token": target_token,
         "target_amount": target_amount,
         "last_updated": _now()
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
@@ -153,7 +174,7 @@ def update_position_ranges(pos_id: int, lower: float, upper: float, initial_pric
         "token1_amount": token1,
         "liquidity": liquidity,
         "last_updated": _now()
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
@@ -161,7 +182,7 @@ def update_position_status(pos_id: int, status: str):
     supabase.table("positions").update({
         "status": status,
         "last_updated": _now()
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
@@ -169,7 +190,7 @@ def update_position_date(pos_id: int, created_at: str):
     supabase.table("positions").update({
         "created_at": created_at,
         "last_updated": _now()
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
@@ -178,12 +199,12 @@ def update_position_current_balances(pos_id: int, token0_current: float, token1_
         "token0_current": token0_current,
         "token1_current": token1_current,
         "last_updated": _now()
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
 def update_v2_pool_status(pool_id: int, status: str):
-    supabase.table("v2_pools").update({"status": status}).eq("id", pool_id).execute()
+    supabase.table("v2_pools").update({"status": status}).eq("id", pool_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
@@ -191,12 +212,12 @@ def update_v2_pool_balances(pool_id: int, token0_current: float, token1_current:
     supabase.table("v2_pools").update({
         "token0_current": token0_current,
         "token1_current": token1_current
-    }).eq("id", pool_id).execute()
+    }).eq("id", pool_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
 def update_custom_position_status(pos_id: int, status: str):
-    supabase.table("custom_positions").update({"status": status}).eq("id", pos_id).execute()
+    supabase.table("custom_positions").update({"status": status}).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 # ─── Fee Logging ─────────────────────────────────────────────────────────────
@@ -232,7 +253,7 @@ def log_fees(pos_id: int, token0_amount: float, token1_amount: float, reinvested
             "token0_current": None,
             "token1_current": None,
             "last_updated": _now()
-        }).eq("id", pos_id).execute()
+        }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
     else:
         old_fees0 = float(cur_data.get("fees_token0", 0) or 0)
         old_fees1 = float(cur_data.get("fees_token1", 0) or 0)
@@ -244,7 +265,7 @@ def log_fees(pos_id: int, token0_amount: float, token1_amount: float, reinvested
             "fees_token0_total": old_total0 + token0_amount,
             "fees_token1_total": old_total1 + token1_amount,
             "last_updated": _now()
-        }).eq("id", pos_id).execute()
+        }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
@@ -268,7 +289,7 @@ def delete_fee_log(log_id: int):
             "token0_current": None,
             "token1_current": None,
             "last_updated": _now()
-        }).eq("id", pos_id).execute()
+        }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
     supabase.table("fees_log").delete().eq("id", log_id).execute()
 
@@ -293,7 +314,7 @@ def delete_fee_log(log_id: int):
         "fees_token0_total": new_total0,
         "fees_token1_total": new_total1,
         "last_updated": _now()
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
@@ -305,7 +326,7 @@ def clear_all_fees(pos_id: int):
         "fees_token0_total": 0.0,
         "fees_token1_total": 0.0,
         "last_updated": _now()
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 def get_fees_log(pos_id: int) -> list:
@@ -313,17 +334,19 @@ def get_fees_log(pos_id: int) -> list:
     return result.data
 
 
-# ──��� Custom Positions CRUD ───────────────────────────────────────────────────
+# ─── Custom Positions CRUD ───────────────────────────────────────────────────
 
 def add_custom_position(
-    type: str, protocol: str, network: str,
+    _type: str, protocol: str, network: str,
     asset_deposited: str, amount_deposited: float,
     asset_borrowed: str = None, amount_borrowed: float = 0.0,
     liquidation_threshold: float = None, apy: float = None,
-    notes: str = None, is_public: bool = False, created_at: str = None
+    notes: str = None, is_public: bool = False, created_at: str = None,
+    owner_id: str = None,
 ):
+    actual_owner = owner_id if owner_id else _CURRENT_OWNER
     data = {
-        "type": type,
+        "type": _type,
         "protocol": protocol,
         "network": network,
         "asset_deposited": asset_deposited,
@@ -336,24 +359,26 @@ def add_custom_position(
         "created_at": created_at,
         "notes": notes,
         "is_public": int(is_public),
+        "owner_id": actual_owner,
         "initial_body_usd": amount_deposited,
         "current_body_usd": amount_deposited,
     }
     supabase.table("custom_positions").insert(data).execute()
 
 
-def get_custom_positions(status_filter: str = None) -> list:
-    query = supabase.table("custom_positions").select("*")
+def get_custom_positions(status_filter: str = None, owner_id: str = None) -> list:
+    query = _owner_filter(supabase.table("custom_positions").select("*"), owner_id)
     if status_filter:
         query = query.eq("status", status_filter)
-    result = query.order("created_at", desc=True).execute()
+    query = query.order("created_at", desc=True)
+    result = query.execute()
     return result.data
 
 
 def update_custom_position(pos_id: int, **kwargs):
     if not kwargs:
         return
-    supabase.table("custom_positions").update(kwargs).eq("id", pos_id).execute()
+    supabase.table("custom_positions").update(kwargs).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 def soft_delete_custom_position(pos_id: int):
@@ -361,7 +386,7 @@ def soft_delete_custom_position(pos_id: int):
 
 
 def hard_delete_custom_position(pos_id: int):
-    supabase.table("custom_positions").delete().eq("id", pos_id).execute()
+    supabase.table("custom_positions").delete().eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 def _recalc_actual_apy(initial_body: float, current_body: float, total_fees: float, created_at: str) -> float | None:
@@ -384,19 +409,16 @@ def update_custom_body(pos_id: int, current_body_usd: float):
     result = supabase.table("custom_positions").select("initial_body_usd, total_fees_usd, created_at").eq("id", pos_id).execute()
     if not result.data:
         return
-
     row = result.data[0]
     initial_body = float(row.get("initial_body_usd", 0) or 0.0)
     total_fees = float(row.get("total_fees_usd", 0) or 0.0)
     created_at_val = row.get("created_at", "")
-
     actual_apy = _recalc_actual_apy(initial_body, current_body_usd, total_fees, created_at_val)
-
     supabase.table("custom_positions").update({
         "current_body_usd": current_body_usd,
         "last_updated": _now(),
         "actual_apy": actual_apy
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
@@ -404,19 +426,16 @@ def update_custom_fees(pos_id: int, total_fees_usd: float):
     result = supabase.table("custom_positions").select("initial_body_usd, current_body_usd, created_at").eq("id", pos_id).execute()
     if not result.data:
         return
-
     row = result.data[0]
     initial_body = float(row.get("initial_body_usd", 0) or 0.0)
     current_body = float(row.get("current_body_usd", 0) or 0.0)
     created_at_val = row.get("created_at", "")
-
     actual_apy = _recalc_actual_apy(initial_body, current_body, total_fees_usd, created_at_val)
-
     supabase.table("custom_positions").update({
         "total_fees_usd": total_fees_usd,
         "last_updated": _now(),
         "actual_apy": actual_apy
-    }).eq("id", pos_id).execute()
+    }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 # ─── V2 Pools CRUD ───────────────────────────────────────────────────────────
@@ -428,8 +447,10 @@ def add_v2_pool(
     token0_initial: float, token1_initial: float,
     initial_price: float, created_at: str,
     apy: float = None, goal: str = 'balanced',
-    target_token: str = None, target_amount: float = None, is_public: bool = False
+    target_token: str = None, target_amount: float = None, is_public: bool = False,
+    owner_id: str = None,
 ):
+    actual_owner = owner_id if owner_id else _CURRENT_OWNER
     data = {
         "network": network,
         "dex": dex,
@@ -446,17 +467,19 @@ def add_v2_pool(
         "target_amount": target_amount,
         "status": "active",
         "is_public": int(is_public),
+        "owner_id": actual_owner,
         "token0_current": token0_initial,
         "token1_current": token1_initial,
     }
     supabase.table("v2_pools").insert(data).execute()
 
 
-def get_v2_pools(status_filter: str = None) -> list:
-    query = supabase.table("v2_pools").select("*")
+def get_v2_pools(status_filter: str = None, owner_id: str = None) -> list:
+    query = _owner_filter(supabase.table("v2_pools").select("*"), owner_id)
     if status_filter:
         query = query.eq("status", status_filter)
-    result = query.order("created_at", desc=True).execute()
+    query = query.order("created_at", desc=True)
+    result = query.execute()
     return result.data
 
 
@@ -464,7 +487,7 @@ def get_v2_pools(status_filter: str = None) -> list:
 def update_v2_pool(pool_id: int, **kwargs):
     if not kwargs:
         return
-    supabase.table("v2_pools").update(kwargs).eq("id", pool_id).execute()
+    supabase.table("v2_pools").update(kwargs).eq("id", pool_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 def soft_delete_v2_pool(pool_id: int):
@@ -472,8 +495,10 @@ def soft_delete_v2_pool(pool_id: int):
 
 
 def hard_delete_v2_pool(pool_id: int):
-    supabase.table("v2_fees_log").delete().eq("v2_pool_id", pool_id).execute()
-    supabase.table("v2_pools").delete().eq("id", pool_id).execute()
+    pool = supabase.table("v2_pools").select("id").eq("id", pool_id).eq("owner_id", _CURRENT_OWNER).execute()
+    if pool.data:
+        supabase.table("v2_fees_log").delete().eq("v2_pool_id", pool_id).execute()
+        supabase.table("v2_pools").delete().eq("id", pool_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
@@ -484,16 +509,14 @@ def log_v2_fees(pool_id: int, fee_token0: float, fee_token1: float, timestamp: s
         "fee_token0": fee_token0,
         "fee_token1": fee_token1
     }).execute()
-
     cur_v2 = supabase.table("v2_pools").select("fees_token0_total, fees_token1_total").eq("id", pool_id).execute()
     v2_data = cur_v2.data[0] if cur_v2.data else {}
     old_v2_total0 = float(v2_data.get("fees_token0_total", 0) or 0)
     old_v2_total1 = float(v2_data.get("fees_token1_total", 0) or 0)
-
     supabase.table("v2_pools").update({
         "fees_token0_total": old_v2_total0 + fee_token0,
         "fees_token1_total": old_v2_total1 + fee_token1
-    }).eq("id", pool_id).execute()
+    }).eq("id", pool_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 def get_v2_fees_log(pool_id: int) -> list:
@@ -507,7 +530,7 @@ def clear_all_v2_fees(pool_id: int):
     supabase.table("v2_pools").update({
         "fees_token0_total": 0,
         "fees_token1_total": 0
-    }).eq("id", pool_id).execute()
+    }).eq("id", pool_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 # ─── Public Visibility Functions ────────────────────────────────────────────
@@ -534,17 +557,17 @@ def get_public_custom_positions():
 
 @supabase_db_retry
 def update_position_visibility(pos_id: int, is_public: int):
-    supabase.table("positions").update({"is_public": is_public}).eq("id", pos_id).execute()
+    supabase.table("positions").update({"is_public": is_public}).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
 def update_v2_pool_visibility(pool_id: int, is_public: int):
-    supabase.table("v2_pools").update({"is_public": is_public}).eq("id", pool_id).execute()
+    supabase.table("v2_pools").update({"is_public": is_public}).eq("id", pool_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 @supabase_db_retry
 def update_custom_visibility(cpos_id: int, is_public: int):
-    supabase.table("custom_positions").update({"is_public": is_public}).eq("id", cpos_id).execute()
+    supabase.table("custom_positions").update({"is_public": is_public}).eq("id", cpos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
 
 # ─── Auth Token Functions ────────────────────────────────────────────────────

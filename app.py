@@ -13,6 +13,7 @@ from data.db import (
     update_custom_body, update_custom_fees,
     get_v2_pools, get_public_v2_pools, get_public_custom_positions,
     update_position_current_balances,
+    get_all_public_positions,
     update_v2_pool, soft_delete_v2_pool, hard_delete_v2_pool,
     log_v2_fees, get_v2_fees_log, clear_all_v2_fees,
     update_v2_pool_status, update_custom_position_status,
@@ -425,22 +426,30 @@ if st.sidebar.button("🔄 Обновить цены"):
 # ─── Load positions ────────────────────────────────────────────────────────────
 st.title("💹 Мои LP-позиции")
 
-raw_positions = get_all_positions()
-
 if st.session_state.authenticated:
-    visible_positions = raw_positions
-else:
-    visible_positions = [p for p in raw_positions if p['is_public'] == 1]
-
-if not visible_positions and not st.session_state.get('authenticated', False):
-    st.info("Пока нет доступных позиций. Администратор может добавить их в разделе **Добавить позицию**.")
-    st.stop()
-
-# ─── Load Custom Positions ───────────────────────────────────────────────────
-if st.session_state.authenticated:
+    raw_positions = get_all_positions()
+    # V2 Pools
+    v2_pools_raw = get_v2_pools()
+    # Custom Positions
     custom_raw = get_custom_positions(status_filter='active')
 else:
+    raw_positions = get_all_public_positions() # Получаем все публичные позиции, owner_id не важен
+    v2_pools_raw = get_public_v2_pools()
     custom_raw = get_public_custom_positions()
+
+# Разделяем V3, V2 и Custom из общего публичного списка для Guest mode
+if not st.session_state.authenticated:
+    v3_public_raw = [p for p in raw_positions if p.get("type") not in ["V2 Pool", "Custom"]]
+    v2_pools_raw = [p for p in raw_positions if p.get("type") == "V2 Pool"]
+    custom_raw = [p for p in raw_positions if p.get("type") == "Custom"]
+    raw_positions = v3_public_raw
+
+if not raw_positions and not v2_pools_raw and not custom_raw:
+    if st.session_state.get('authenticated', False):
+        st.info("У вас пока нет созданных позиций. Добавьте их в меню слева.")
+    else:
+        st.info("Пока нет доступных публичных позиций.")
+    st.stop()
 
 # ─── Enrich ──────────────────────────────────────────────────────────────────
 positions_enriched = []
@@ -448,7 +457,9 @@ total_value       = 0.0
 total_fees_usd    = 0.0
 il_list           = []
 
-for raw in visible_positions:
+for raw in raw_positions:
+    if 'pair' not in raw:
+        continue
     pos = dict(raw)
     pair      = pos['pair']
     network   = pos['network']
@@ -668,15 +679,28 @@ for raw in v2_raw:
 
 # ─── Sidebar summary ─────────────────────────────────────────────────────────
 st.sidebar.divider()
-st.sidebar.subheader("Портфель")
-st.sidebar.metric("Стоимость в пулах",  f"${total_value:,.2f}")
-st.sidebar.metric("Накоплено комиссий", f"${total_fees_usd:,.2f}")
-avg_il = sum(il_list) / len(il_list) if il_list else 0.0
-st.sidebar.metric("Средний IL",         f"{avg_il:.2f}%")
 
-critical_count = sum(1 for p in positions_enriched if p['_rec']['severity'] == 'critical')
-if critical_count:
-    st.sidebar.error(f"⚠️ {critical_count} позиций требуют внимания!")
+if st.session_state.authenticated:
+    sidebar_value = sum(p.get('current_value', 0.0) for p in positions_enriched if p.get('status') != 'closed')
+    sidebar_value += sum(p.get('val_dep', 0.0) for p in custom_enriched)
+    sidebar_value += sum(p.get('current_value', 0.0) for p in v2_enriched)
+
+    sidebar_fees = sum(p.get('fees_usd', 0.0) for p in positions_enriched if p.get('status') != 'closed')
+    sidebar_fees += sum(p.get('total_fees_usd', 0.0) for p in custom_enriched)
+    sidebar_fees += sum(p.get('fees_usd', 0.0) for p in v2_enriched)
+
+    st.sidebar.subheader("Портфель")
+    st.sidebar.metric("Стоимость в пулах",  f"${sidebar_value:,.2f}")
+    st.sidebar.metric("Накоплено комиссий", f"${sidebar_fees:,.2f}")
+    avg_il = sum(il_list) / len(il_list) if il_list else 0.0
+    st.sidebar.metric("Средний IL",         f"{avg_il:.2f}%")
+
+    critical_count = sum(1 for p in positions_enriched if p['_rec']['severity'] == 'critical')
+    if critical_count:
+        st.sidebar.error(f"⚠️ {critical_count} позиций требуют внимания!")
+else:
+    st.sidebar.subheader("Портфель")
+    st.sidebar.info("👤 Войдите как администратор для просмотра статистики")
 
 # ─── Position Cards ───────────────────────────────────────────────────────────
 def render_position_card(pos):
