@@ -21,19 +21,26 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     st.stop()
 
 
-def _make_client(url: str, key: str) -> Client:
-    """Creates a standard Supabase Client supporting both JWT and sb_secret_* keys."""
-    dummy_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSJ9.fake_signature"
-    client = create_client(url, dummy_jwt)
-    real_headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}"
-    }
-    client.postgrest.auth(key)
-    if hasattr(client.postgrest, "session") and client.postgrest.session:
-        client.postgrest.session.headers.update(real_headers)
-        transport = httpx.HTTPTransport(retries=3)
-        client.postgrest.session._transport = transport
+def _make_client(url: str, key: str) -> Client: 
+    """Manually constructs a standard Supabase Client to safely support sb_secret_* keys."""
+    # 1. Prepare authentic headers for the new Supabase key format 
+    headers = { 
+        "apikey": key, 
+        "Authorization": f"Bearer {key}" 
+    } 
+    
+    # 2. Instantiated the Client directly (bypassing create_client regex checks) 
+    client = Client(supabase_url=url, supabase_key=key) 
+    
+    # 3. Explicitly apply headers and transport retries to the underlying sync postgrest client 
+    if hasattr(client, "postgrest") and client.postgrest: 
+        transport = httpx.HTTPTransport(retries=3) 
+        client.postgrest.session = httpx.Client( 
+            base_url=f"{url}/rest/v1", 
+            headers=headers, 
+            transport=transport 
+        ) 
+    
     return client
 
 
