@@ -218,7 +218,10 @@ if summary_data:
         hide_index=True
     )
 else:
-    st.info("Нет данных для отображения.")
+    if st.session_state.get('authenticated', False):
+        st.info("У вас пока нет созданных позиций. Добавьте их в меню слева.")
+    else:
+        st.info("Пока нет доступных публичных позиций.")
 
 st.divider()
 

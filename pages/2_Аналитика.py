@@ -18,7 +18,10 @@ else:
     positions = [p for p in raw_positions if p.is_public]
 
 if not positions:
-    st.info("У вас пока нет активных позиций. Вы можете запустить 'What-if' анализ ниже.")
+    if st.session_state.get("authenticated", False):
+        st.info("У вас пока нет созданных позиций. Добавьте их в меню слева.")
+    else:
+        st.info("Пока нет доступных публичных позиций. Вы можете запустить 'What-if' анализ ниже.")
     selected_pos = None
 else:
     pos_options = {f"{p.network} | {p.dex} | {p.pair}": p for p in positions}
