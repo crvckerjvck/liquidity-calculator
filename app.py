@@ -1159,8 +1159,22 @@ def render_custom_position_card(cpos):
                 if st.button("💰 Внести комиссии", key=f"cfee_{cpos['id']}"):
                     custom_fee_dialog(cpos)
 
-public_enriched = [p for p in positions_enriched if p.get('is_public') == 1]
-private_enriched = [p for p in positions_enriched if p.get('is_public') == 0]
+# Robust type-tolerant helpers for Supabase is_public field
+def _is_public(d: dict) -> bool:
+    v = d.get('is_public')
+    return v in (1, True, '1', 'true', 'True', 1.0)
+
+def _is_private(d: dict) -> bool:
+    v = d.get('is_public')
+    return v in (0, False, '0', 'false', 'False', 0.0)
+
+public_enriched = [p for p in positions_enriched if _is_public(p)]
+private_enriched = [p for p in positions_enriched if _is_private(p)]
+
+# In guest mode, all V3 positions from DB are public by definition
+if not st.session_state.authenticated:
+    public_enriched = positions_enriched
+    private_enriched = []
 
 if public_enriched:
     st.subheader("🌐 Публичные позиции")
@@ -1175,8 +1189,13 @@ if private_enriched and st.session_state.authenticated:
         render_position_card(pos)
 
 # ─── V2 Pools Section ────────────────────────────────────────────────────────
-public_v2 = [p for p in v2_enriched if p.get('is_public') == 1]
-private_v2 = [p for p in v2_enriched if p.get('is_public') == 0]
+public_v2 = [p for p in v2_enriched if _is_public(p)]
+private_v2 = [p for p in v2_enriched if _is_private(p)]
+
+# In guest mode, all V2 pools from DB are public by definition
+if not st.session_state.authenticated:
+    public_v2 = v2_enriched
+    private_v2 = []
 
 if public_v2:
     if public_enriched or private_enriched:
@@ -1192,21 +1211,33 @@ if private_v2 and st.session_state.authenticated:
         render_v2_position_card(pos)
 
 # ─── Custom Positions Section ───────────────────────────────────────────────
-public_custom = [c for c in custom_enriched if c.get('is_public') == 1]
-private_custom = [c for c in custom_enriched if c.get('is_public') == 0]
+public_custom = [c for c in custom_enriched if _is_public(c)]
+private_custom = [c for c in custom_enriched if _is_private(c)]
+
+# In guest mode, all custom positions from DB are public by definition
+if not st.session_state.authenticated:
+    public_custom = custom_enriched
+    private_custom = []
 
 if public_custom:
-    if public_v2 or private_v2 or public_enriched or private_enriched:
+    has_prev = bool(public_v2 or private_v2 or public_enriched or private_enriched)
+    if has_prev:
         st.divider()
     st.subheader("🌐 Публичные DeFi-позиции")
     for cpos in public_custom:
-        render_custom_position_card(cpos)
+        try:
+            render_custom_position_card(cpos)
+        except Exception as e:
+            st.error(f"Ошибка отрисовки кастомной позиции #{cpos.get('id', '?')}: {e}")
 
 if private_custom and st.session_state.authenticated:
     st.divider()
     st.subheader("🔐 Мои личные DeFi-позиции")
     for cpos in private_custom:
-        render_custom_position_card(cpos)
+        try:
+            render_custom_position_card(cpos)
+        except Exception as e:
+            st.error(f"Ошибка отрисовки кастомной позиции #{cpos.get('id', '?')}: {e}")
 
 # ─── Closed Positions Section ────────────────────────────────────────────────
 closed_v3 = [pos for pos in positions_enriched if pos.get('status') == 'closed']
