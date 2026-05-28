@@ -8,8 +8,7 @@ from typing import Optional
 
 import streamlit as st
 from dotenv import load_dotenv
-import httpx
-from supabase import create_client, Client
+from supabase import create_client
 
 load_dotenv()
 
@@ -32,41 +31,8 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     st.error("Supabase credentials missing!")
     st.stop()
 
-
-def _make_client(url: str, key: str) -> Client:
-    """Creates a Supabase client safely supporting both standard and sb_secret_* keys
-
-    by bypassing strict local regex validation.
-    """
-    # 1. Check if the key uses the new format and prepare a dummy JWT to trick the constructor regex
-    is_new_format = key.startswith("sb_secret_")
-    fake_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy.auth"
-
-    init_key = fake_jwt if is_new_format else key
-
-    # 2. Instantiate the Client (bypassing the SupabaseException)
-    client = Client(supabase_url=url, supabase_key=init_key)
-
-    # 3. Explicitly apply authentic headers with the REAL key to the underlying postgrest client
-    if hasattr(client, "postgrest") and client.postgrest:
-        headers = {
-            "apikey": key,
-            "Authorization": f"Bearer {key}"
-        }
-        transport = httpx.HTTPTransport(retries=3)
-        client.postgrest.session = httpx.Client(
-            base_url=f"{url}/rest/v1",
-            headers=headers,
-            transport=transport
-        )
-        # Override the internal auth_token that postgrest uses during execute(),
-        # otherwise it appends the fake JWT and causes 401 on the server
-        client.postgrest.auth_token = key
-
-    return client
-
-
-supabase = _make_client(SUPABASE_URL, SUPABASE_KEY)
+# Use the standard native SDK method directly
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 _CURRENT_OWNER = os.getenv("APP_OWNER_ID") or st.secrets.get("APP_OWNER_ID") or "user1"
 
