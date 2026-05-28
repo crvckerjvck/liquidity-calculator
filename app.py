@@ -437,10 +437,9 @@ else:
 
 # Разделяем V3, V2 и Custom из общего публичного списка для Guest mode
 if not st.session_state.authenticated:
-    v3_public_raw = [p for p in raw_positions if p.get("type") not in ["V2 Pool", "Custom"]]
-    v2_pools_raw = [p for p in raw_positions if p.get("type") == "V2 Pool"]
-    custom_raw = [p for p in raw_positions if p.get("type") == "Custom"]
-    raw_positions = v3_public_raw
+    # Фильтруем только V3 позиции (у них есть lower_price). V2 и Custom уже загружены
+    # из отдельных get_public_v2_pools() / get_public_custom_positions()
+    raw_positions = [p for p in raw_positions if p.get('lower_price') is not None]
 
 if not raw_positions and not v2_pools_raw and not custom_raw:
     if st.session_state.get('authenticated', False):
