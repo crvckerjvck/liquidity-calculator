@@ -339,9 +339,14 @@ def add_custom_position(
     asset_borrowed: str = None, amount_borrowed: float = 0.0,
     liquidation_threshold: float = None, apy: float = None,
     notes: str = None, is_public: bool = False, created_at: str = None,
-    owner_id: str = None,
+    owner_id: str = None, val_dep: float = None,
 ):
     actual_owner = owner_id if owner_id else _CURRENT_OWNER
+    # Compute USD value of the deposit if not provided directly
+    if val_dep is not None and val_dep > 0:
+        body_usd = val_dep
+    else:
+        body_usd = amount_deposited
     data = {
         "type": _type,
         "protocol": protocol,
@@ -357,8 +362,8 @@ def add_custom_position(
         "notes": notes,
         "is_public": int(is_public),
         "owner_id": actual_owner,
-        "initial_body_usd": amount_deposited,
-        "current_body_usd": amount_deposited,
+        "initial_body_usd": body_usd,
+        "current_body_usd": body_usd,
     }
     supabase.table("custom_positions").insert(data).execute()
 

@@ -1,6 +1,7 @@
 import streamlit as st
 from datetime import date
 from data.db import add_custom_position, add_v2_pool
+from data.price_client import get_current_price
 
 # Page config
 st.set_page_config(page_title="Добавить произвольную позицию", page_icon="➕")
@@ -113,6 +114,9 @@ with st.form("custom_position_form"):
                 st.error("Укажите актив займа, если введено количество.")
             else:
                 try:
+                    # Fetch current price for USD value calculation
+                    usd_price = get_current_price(asset_dep.upper(), network.lower()) or 0.0
+                    val_dep = amount_dep * usd_price if usd_price > 0 else amount_dep
                     add_custom_position(
                         _type=pos_type.lower().replace(" ", "_"),
                         protocol=protocol,
@@ -125,7 +129,8 @@ with st.form("custom_position_form"):
                         apy=apy,
                         notes=notes,
                         is_public=is_public,
-                        created_at=created_at.isoformat()
+                        created_at=created_at.isoformat(),
+                        val_dep=val_dep,
                     )
                     st.success("✅ Позиция успешно добавлена!")
                     st.balloons()
