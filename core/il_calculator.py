@@ -82,6 +82,84 @@ def compute_liquidity_from_deposit(
         return 0.0
 
 
+def calculate_required_amounts(
+    lower_price: float,
+    upper_price: float,
+    current_price: float,
+    amount0: float | None = None,
+    amount1: float | None = None,
+) -> Tuple[float, float, float, str]:
+    """
+    Рассчитывает пропорциональные количества токенов для Uniswap V3 позиции.
+
+    Пользователь вводит amount0 ИЛИ amount1, функция вычисляет необходимое
+    количество второго токена для создания сбалансированной позиции.
+
+    Возвращает (amount0_out, amount1_out, L, based_on),
+    где based_on указывает, какой токен был исходным ('token0' или 'token1').
+
+    Использует строгую математику Uniswap V3:
+      - P < Pa: 100% token0, token1 = 0
+      - P > Pb: 100% token1, token0 = 0
+      - Pa <= P <= Pb: L = min(L_from_0, L_from_1), пропорции фиксированы
+    """
+    if lower_price <= 0 or upper_price <= lower_price or current_price <= 0:
+        return (0.0, 0.0, 0.0, 'none')
+
+    sqrt_pa = math.sqrt(lower_price)
+    sqrt_pb = math.sqrt(upper_price)
+    sqrt_p  = math.sqrt(current_price)
+
+    if current_price < lower_price:
+        # Price below range — 100% token0, token1 = 0
+        denom = (1.0 / sqrt_pa - 1.0 / sqrt_pb)
+        if denom <= 0:
+            return (0.0, 0.0, 0.0, 'none')
+        if amount0 is not None and amount0 > 0:
+            L = amount0 / denom
+            return (amount0, 0.0, L, 'token0')
+        elif amount1 is not None and amount1 > 0:
+            L = amount1 / (sqrt_pb - sqrt_pa) if amount1 > 0 else 0.0
+            amount0_calc = L * denom
+            return (amount0_calc, amount1, L, 'token1')
+        else:
+            return (0.0, 0.0, 0.0, 'none')
+
+    elif current_price > upper_price:
+        # Price above range — 100% token1, token0 = 0
+        denom = sqrt_pb - sqrt_pa
+        if denom <= 0:
+            return (0.0, 0.0, 0.0, 'none')
+        if amount1 is not None and amount1 > 0:
+            L = amount1 / denom
+            return (0.0, amount1, L, 'token1')
+        elif amount0 is not None and amount0 > 0:
+            L = amount0 / (1.0 / sqrt_pa - 1.0 / sqrt_pb) if amount0 > 0 else 0.0
+            amount1_calc = L * denom
+            return (amount0, amount1_calc, L, 'token0')
+        else:
+            return (0.0, 0.0, 0.0, 'none')
+
+    else:
+        # Price in range — both tokens present, L = min(L_x, L_y)
+        denom_x = (1.0 / sqrt_p - 1.0 / sqrt_pb)
+        denom_y = (sqrt_p - sqrt_pa)
+
+        if denom_x <= 0 or denom_y <= 0:
+            return (0.0, 0.0, 0.0, 'none')
+
+        if amount0 is not None and amount0 > 0:
+            L = amount0 / denom_x
+            amount1_calc = L * denom_y
+            return (amount0, amount1_calc, L, 'token0')
+        elif amount1 is not None and amount1 > 0:
+            L = amount1 / denom_y
+            amount0_calc = L * denom_x
+            return (amount0_calc, amount1, L, 'token1')
+        else:
+            return (0.0, 0.0, 0.0, 'none')
+
+
 def calculate_il(
     current_price: float,
     lower_price: float,
