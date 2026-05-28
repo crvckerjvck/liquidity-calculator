@@ -13,8 +13,20 @@ from supabase import create_client, Client
 
 load_dotenv()
 
-SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY")
+# Look for standard names or the custom sb_url/sb_secret names used in cloud secrets
+SUPABASE_URL = (
+    st.secrets.get("SUPABASE_URL")
+    or st.secrets.get("sb_url")
+    or os.getenv("SUPABASE_URL")
+    or os.getenv("sb_url")
+)
+
+SUPABASE_KEY = (
+    st.secrets.get("SUPABASE_KEY")
+    or st.secrets.get("sb_secret")
+    or os.getenv("SUPABASE_KEY")
+    or os.getenv("sb_secret")
+)
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     st.error("Supabase credentials missing!")
