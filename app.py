@@ -28,19 +28,17 @@ from core.il_calculator import calculate_il_v2, compute_v3_balances, calculate_i
 from core.goal_recommendations import get_goal_recommendation, GOAL_LABELS
 from core.metrics import calculate_actual_apy
 
-# Import date and datetime for APR calculation
 from datetime import date, datetime
 
-from data.db import initialize_database
-
-# Инициализация базы данных при запуске приложения
-initialize_database()
-
+# 1. Must be the very first Streamlit command
 st.set_page_config(
     page_title="Liquidity Lounge Tracker",
     page_icon="💹",
     layout="wide"
 )
+
+# 2. Database init can safely run now
+initialize_database()
 
 # Auto-refresh every 5 minutes
 st_autorefresh(interval=300_000, key="auto_refresh")
