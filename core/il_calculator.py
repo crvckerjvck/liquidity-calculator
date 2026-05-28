@@ -89,41 +89,62 @@ def calculate_il(
     initial_token0: float,
     initial_token1: float,
     initial_price: float | None = None,
+    current_token0: float | None = None,
+    current_token1: float | None = None,
+    investment_goal: str = "preserve_asset",
+    entry_usd_total: float | None = None,
 ) -> Tuple[float, float, float]:
     """
     Рассчитывает Impermanent Loss и текущую стоимость позиции V3.
 
+    Для цели 'accumulate_stable' (накопление стейблов):
+      baseline = entry_usd_total (исходный USD-депозит)
+      IL считается relative to USD, без капа в 0 (может быть положительным).
+
+    Для всех остальных целей:
+      baseline = (initial_token0 * current_price) + initial_token1 (HODL)
+      IL capped at 0 (V3 cushion can make V_current > V_hodl).
+
     Возвращает (il_percent, il_dollar, current_value).
-
-    ФОРМУЛЫ:
-      L = compute_liquidity_from_deposit(...)
-      x_real, y_real = compute_v3_balances(L, Pa, Pb, P_current)
-      V_current = x_real * P_current + y_real
-      V_hold = x_init * P_current + y_init
-      IL_usd = V_current - V_hold
-      IL_pct = IL_usd / V_hold * 100
-
-    IL отрицателен, когда V_current < V_hold (цена вышла из диапазона).
     """
     if initial_price is None or initial_price <= 0:
         initial_price = current_price
 
-    L = compute_liquidity_from_deposit(
-        lower_price, upper_price, initial_price,
-        initial_token0, initial_token1
-    )
+    # Calculate current pool value
+    if current_token0 is not None and current_token1 is not None:
+        current_value = (current_token0 * current_price) + current_token1
+    else:
+        L = compute_liquidity_from_deposit(
+            lower_price, upper_price, initial_price,
+            initial_token0, initial_token1
+        )
+        curr0, curr1 = compute_v3_balances(L, lower_price, upper_price, current_price)
+        current_value = (curr0 * current_price) + curr1
 
-    curr0, curr1 = compute_v3_balances(L, lower_price, upper_price, current_price)
+    # Goal-based baseline selection
+    if investment_goal == 'accumulate_stable':
+        # Baseline is the original USD entry value
+        if entry_usd_total is not None and entry_usd_total > 0:
+            baseline_value = entry_usd_total
+        else:
+            baseline_value = (initial_token0 * initial_price) + initial_token1
+    else:
+        # Baseline is token HODL value at current price
+        baseline_value = (initial_token0 * current_price) + initial_token1
 
-    current_value = curr0 * current_price + curr1
-    hold_value = initial_token0 * current_price + initial_token1
-
-    if hold_value > 0:
-        il_dollar = current_value - hold_value
-        il_percent = il_dollar / hold_value * 100.0
+    # Calculate divergence vs baseline
+    if baseline_value > 0:
+        il_dollar = current_value - baseline_value
+        il_percent = (il_dollar / baseline_value) * 100.0
     else:
         il_dollar = 0.0
         il_percent = 0.0
+
+    # Cap standard IL at 0% (only for non-accumulate_stable goals)
+    # Preserve raw il_dollar for UI rendering even when percent is capped
+    if investment_goal != 'accumulate_stable':
+        if il_percent >= 0:
+            il_percent = 0.0
 
     return (il_percent, il_dollar, current_value)
 

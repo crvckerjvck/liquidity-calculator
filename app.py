@@ -24,7 +24,7 @@ from core.position_state import (
     compute_liquidity, compute_il, range_proximity,
     get_composition_at_bounds, compute_liquidity_delta
 )
-from core.il_calculator import calculate_il_v2, compute_v3_balances
+from core.il_calculator import calculate_il_v2, compute_v3_balances, calculate_il
 from core.goal_recommendations import get_goal_recommendation, GOAL_LABELS
 from core.metrics import calculate_actual_apy
 
@@ -493,29 +493,28 @@ for raw in raw_positions:
     init_price_for_il = float(pos.get('initial_price') or 0.0)
     token0_initial = float(pos.get('token0_amount_initial') or 0.0)
     token1_initial = float(pos.get('token1_amount_initial') or 0.0)
-    # Если начальные количества не заданы (старые позиции), используем текущие
-    if token0_initial == 0 and token1_initial == 0:
-        token0_initial = float(pos.get('token0_amount') or 0.0)
-        token1_initial = float(pos.get('token1_amount') or 0.0)
+    # Если начальные количества не заданы (старые/мигрированные позиции), восстанавливаем из L и цены входа
+    if (token0_initial == 0.0 and token1_initial == 0.0) and L > 0 and init_price_for_il > 0 and lower > 0 and upper > lower:
+        token0_initial, token1_initial = compute_v3_balances(L, lower, upper, init_price_for_il)
     entry_value = (token0_initial * init_price_for_il + token1_initial) if init_price_for_il > 0 else 0.0
     pos['entry_value'] = entry_value
 
-    # IL: всегда рассчитываем на основе ликвидности, а не ручных балансов
-    if price > 0 and entry_value > 0 and init_price_for_il > 0:
-        hold_value = token0_initial * price + token1_initial
-        # Для IL используем compute_v3_balances (без учёта ручной корректировки)
-        if L > 0 and lower > 0 and upper > lower and price > 0:
-            il_curr0, il_curr1 = compute_v3_balances(L, lower, upper, price)
-        else:
-            il_curr0, il_curr1 = token0_initial, token1_initial
-        pool_value = il_curr0 * price + il_curr1 * q_price
-        if hold_value > 0:
-            il_pct = (pool_value - hold_value) / hold_value * 100.0
-            il_usd = pool_value - hold_value
-        else:
-            il_pct, il_usd = 0.0, 0.0
+    # IL рассчитывается строго от начальных количеств при цене входа
+    if init_price_for_il > 0 and (token0_initial > 0 or token1_initial > 0):
+        il_pct, il_usd, pool_value = calculate_il(
+            current_price=price,
+            lower_price=lower,
+            upper_price=upper,
+            initial_token0=token0_initial,
+            initial_token1=token1_initial,
+            initial_price=init_price_for_il,
+            current_token0=curr0,
+            current_token1=curr1,
+            investment_goal=pos.get('goal', 'preserve_asset'),
+            entry_usd_total=entry_value if entry_value > 0 else None,
+        )
     else:
-        il_pct, il_usd = 0.0, 0.0
+        il_pct, il_usd, pool_value = 0.0, 0.0, 0.0
     pos['il_percent'] = il_pct
     pos['il_usd']     = il_usd
 
@@ -739,10 +738,13 @@ def render_position_card(pos):
             if pos.get('is_public') == 1:
                 public_badge = "<span style='margin-left: 10px; padding: 2px 8px; background: #2980b9; border-radius: 4px; font-size: 0.7rem;'>🌐 PUBLIC</span>"
 
+            owner_id = pos.get('owner_id', 'unknown')
+            owner_badge = f"<span style='margin-left: 10px; padding: 2px 8px; background: #34495e; color: #bdc3c7; border-radius: 4px; font-size: 0.7rem;'>👤 owner: {owner_id}</span>"
+
             st.markdown(
                 f"<div style='display: flex; align-items: center; justify-content: space-between;'>"
                 f"<h3 style='margin:0; font-size: 1.25rem; font-family: inherit;'>{in_range_icon} {pair} &nbsp;"
-                f"<span style='font-size:0.75rem;color:#888;font-weight:normal;'>{pos['network'].upper()} · {pos['dex']}</span>{public_badge}"
+                f"<span style='font-size:0.75rem;color:#888;font-weight:normal;'>{pos['network'].upper()} · {pos['dex']}</span>{public_badge}{owner_badge}"
                 f"</h3>"
                 f"<div style='display: flex; align-items: center;'>"
                 f"<span style='font-size:1.1rem;color:#fff;font-weight:600;margin-right:15px;'>{val_str}</span>"
@@ -824,8 +826,16 @@ def render_position_card(pos):
             st.markdown(f"Текущая стоимость позиции ($): ${total_with_fees:,.2f}{pnl_str}", unsafe_allow_html=True)
             
         with m3:
-            il_color = "normal" if pos['il_percent'] >= -settings_cfg.get('il_warning_percent', 3.0) else "inverse"
-            st.metric("IL", f"{pos['il_percent']:.2f}%", f"${pos['il_usd']:,.2f}", delta_color=il_color)
+            il_pct = pos.get('il_percent', 0.0)
+            il_usd = pos.get('il_usd', 0.0)
+            if il_usd < 0:
+                il_badge = f"<span style='color:#e74c3c; font-weight:600;'>↓ ${il_usd:,.2f}</span>"
+            elif il_usd > 0:
+                il_badge = f"<span style='color:#2ecc71; font-weight:600;'>↑ +${il_usd:,.2f}</span>"
+            else:
+                il_badge = f"<span style='color:#888; font-weight:600;'>$0.00</span>"
+            st.metric("IL", f"{il_pct:.2f}%")
+            st.markdown(il_badge, unsafe_allow_html=True)
         with m4:
             st.metric("Комиссии (всего)", f"{float(pos.get('fees_token0_total') or 0.0):.4g} {base_sym}")
             st.caption(f"+ {float(pos.get('fees_token1_total') or 0.0):,.2f} {quote_sym}")
@@ -874,23 +884,15 @@ def render_position_card(pos):
             avg_entry_str = "—"
             delta_str = ""
             if init_price > 0:
-                init0 = float(pos.get('token0_amount') or 0.0)
-                init1 = float(pos.get('token1_amount') or 0.0)
-                orig_val = init0 * init_price + init1
-                curr0 = pos['curr0']
-                
-                if curr0 > 0:
-                    avg_entry = (orig_val - init1) / init0 if init0 > 0 else 0
-                    avg_entry_str = f"${avg_entry:,.2f}"
-
-                    # Расчет разницы (прибыль/убыток) в USD
-                    # Δ = (current_price - average_price) * token0_current
-                    delta_usd = (pos.get('current_price', 0.0) - avg_entry) * curr0
-                    delta_sign = "+" if delta_usd >= 0 else ""
-                    delta_color = "green" if delta_usd >= 0 else "red"
-                    delta_str = f"<span style='color:{delta_color}; font-size: 1.1rem; font-weight: bold;'>📈 Δ {delta_sign}${delta_usd:,.2f}</span>"
+                entry_val_for_delta = pos.get('entry_value', 0.0)
+                curr_total = pos_val + pos.get('fees_usd', 0.0)
+                delta_usd = curr_total - entry_val_for_delta if entry_val_for_delta > 0 else 0.0
+                delta_sign = "+" if delta_usd >= 0 else ""
+                delta_color = "green" if delta_usd >= 0 else "red"
+                delta_str = f"<span style='color:{delta_color}; font-size: 1.1rem; font-weight: bold;'>📈 Δ {delta_sign}${delta_usd:,.2f}</span>"
+                avg_entry_str = f"${init_price:,.2f}"
             
-            st.markdown(f"**Средняя цена входа:** {avg_entry_str} за {base_sym}")
+            st.markdown(f"**Цена входа:** {avg_entry_str} за {base_sym}")
             st.markdown(f"**Текущая цена:** ${price:,.4f}")
             if delta_str:
                 st.markdown(delta_str, unsafe_allow_html=True)
@@ -978,9 +980,12 @@ def render_v2_position_card(pos):
             elif st.session_state.authenticated:
                 public_badge_v2 = " 🔒"
 
+            owner_id_v2 = pos.get('owner_id', 'unknown')
+            owner_badge_v2 = f"<span style='margin-left: 10px; padding: 2px 8px; background: #34495e; color: #bdc3c7; border-radius: 4px; font-size: 0.7rem;'>👤 owner: {owner_id_v2}</span>"
+
             st.markdown(
                 f"<div style='display: flex; align-items: center; justify-content: space-between;'>"
-                f"<h3 style='margin:0; font-size: 1.25rem;'>🌊 {pair}{public_badge_v2} <span style='font-size:0.75rem;color:#888;'>V2 {pos['dex']}</span></h3>"
+                f"<h3 style='margin:0; font-size: 1.25rem;'>🌊 {pair}{public_badge_v2}{owner_badge_v2} <span style='font-size:0.75rem;color:#888;'>V2 {pos['dex']}</span></h3>"
                 f"<div style='display: flex; align-items: center;'>"
                 f"<span style='font-size:1.1rem;color:#fff;font-weight:600;margin-right:15px;'>${total_with_fees:,.2f}</span>"
                 f"<span style='color:{pnl_color};font-size:0.85rem;font-weight:600'>{pnl_sign}${pnl_usd:,.2f} ({pnl_sign}{pnl_pct:.1f}%)</span>"
@@ -1060,9 +1065,12 @@ def render_custom_position_card(cpos):
             elif st.session_state.authenticated:
                 pub_badge_custom = " 🔒"
 
+            owner_id_custom = cpos.get('owner_id', 'unknown')
+            owner_badge_custom = f"<span style='margin-left: 10px; padding: 2px 8px; background: #34495e; color: #bdc3c7; border-radius: 4px; font-size: 0.7rem;'>👤 owner: {owner_id_custom}</span>"
+
             st.markdown(
                 f"<div style='display: flex; align-items: center;'>"
-                f"<h3 style='margin:0;'>{icon} {protocol}{pub_badge_custom} &nbsp;"
+                f"<h3 style='margin:0;'>{icon} {protocol}{pub_badge_custom}{owner_badge_custom} &nbsp;"
                 f"<span style='font-size:0.75rem;color:#888;'>{network} · {ctype}</span>"
                 f"</h3></div>",
                 unsafe_allow_html=True

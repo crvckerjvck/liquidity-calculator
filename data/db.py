@@ -22,18 +22,25 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 
 def _make_client(url: str, key: str) -> Client: 
-    """Manually constructs a standard Supabase Client to safely support sb_secret_* keys."""
-    # 1. Prepare authentic headers for the new Supabase key format 
-    headers = { 
-        "apikey": key, 
-        "Authorization": f"Bearer {key}" 
-    } 
+    """Creates a Supabase client safely supporting both standard and sb_secret_* keys 
+ 
+    by bypassing strict local regex validation. 
+    """ 
+    # 1. Check if the key uses the new format and prepare a dummy JWT to trick the constructor regex 
+    is_new_format = key.startswith("sb_secret_") 
+    fake_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy.auth" 
     
-    # 2. Instantiated the Client directly (bypassing create_client regex checks) 
-    client = Client(supabase_url=url, supabase_key=key) 
+    init_key = fake_jwt if is_new_format else key 
     
-    # 3. Explicitly apply headers and transport retries to the underlying sync postgrest client 
+    # 2. Instantiate the Client (bypassing the SupabaseException) 
+    client = Client(supabase_url=url, supabase_key=init_key) 
+    
+    # 3. Explicitly apply authentic headers with the REAL key to the underlying postgrest client 
     if hasattr(client, "postgrest") and client.postgrest: 
+        headers = { 
+            "apikey": key, 
+            "Authorization": f"Bearer {key}" 
+        } 
         transport = httpx.HTTPTransport(retries=3) 
         client.postgrest.session = httpx.Client( 
             base_url=f"{url}/rest/v1", 
@@ -180,6 +187,8 @@ def update_position_ranges(pos_id: int, lower: float, upper: float, initial_pric
         "token0_amount": token0,
         "token1_amount": token1,
         "liquidity": liquidity,
+        "token0_amount_initial": token0,
+        "token1_amount_initial": token1,
         "last_updated": _now()
     }).eq("id", pos_id).eq("owner_id", _CURRENT_OWNER).execute()
 
@@ -544,21 +553,21 @@ def clear_all_v2_fees(pool_id: int):
 
 @supabase_db_retry
 def get_all_public_positions():
-    positions = supabase.table("positions").select("*").eq("is_public", 1).order("created_at", desc=True).execute()
-    v2_pools = supabase.table("v2_pools").select("*").eq("is_public", 1).order("created_at", desc=True).execute()
-    custom = supabase.table("custom_positions").select("*").eq("is_public", 1).eq("status", "active").order("created_at", desc=True).execute()
+    positions = supabase.table("positions").select("*").eq("is_public", 1).eq("owner_id", _CURRENT_OWNER).order("created_at", desc=True).execute()
+    v2_pools = supabase.table("v2_pools").select("*").eq("is_public", 1).eq("owner_id", _CURRENT_OWNER).order("created_at", desc=True).execute()
+    custom = supabase.table("custom_positions").select("*").eq("is_public", 1).eq("owner_id", _CURRENT_OWNER).eq("status", "active").order("created_at", desc=True).execute()
     return positions.data + v2_pools.data + custom.data
 
 
 @supabase_db_retry
 def get_public_v2_pools():
-    result = supabase.table("v2_pools").select("*").eq("is_public", 1).order("created_at", desc=True).execute()
+    result = supabase.table("v2_pools").select("*").eq("is_public", 1).eq("owner_id", _CURRENT_OWNER).order("created_at", desc=True).execute()
     return result.data
 
 
 @supabase_db_retry
 def get_public_custom_positions():
-    result = supabase.table("custom_positions").select("*").eq("is_public", 1).eq("status", "active").order("created_at", desc=True).execute()
+    result = supabase.table("custom_positions").select("*").eq("is_public", 1).eq("owner_id", _CURRENT_OWNER).eq("status", "active").order("created_at", desc=True).execute()
     return result.data
 
 

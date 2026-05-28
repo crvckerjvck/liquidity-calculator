@@ -122,7 +122,7 @@ with st.form("manual_add_form"):
                 # Compute L
                 liquidity = compute_liquidity(initial_price, lower_price, upper_price, token0_amount, token1_amount)
 
-                owner_id = 'public' if is_public else 'admin'
+                owner_id = None  # Будет использован _CURRENT_OWNER из db.py
 
                 try:
                     add_position(
