@@ -114,7 +114,7 @@ with st.form("custom_position_form"):
             else:
                 try:
                     add_custom_position(
-                        type=pos_type.lower().replace(" ", "_"),
+                        _type=pos_type.lower().replace(" ", "_"),
                         protocol=protocol,
                         network=network.lower(),
                         asset_deposited=asset_dep.upper(),
