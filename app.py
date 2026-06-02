@@ -291,20 +291,48 @@ def rebalance_dialog(pos: dict, current_price: float):
     with col2:
         new_upper = st.number_input("Верхняя граница", min_value=0.01, value=float(def_upper), format="%.4f")
 
+    # --- Вспомогательная функция для ребаланса с учетом свопа ---
+    def calculate_rebalance(price, lower, upper, curr_amount0, curr_amount1):
+        import math
+        # 1. Оцениваем текущий капитал (USD)
+        current_val = curr_amount0 * price + curr_amount1
+
+        # 2. Вычисляем стоимость 1 единицы ликвидности (L) для новых границ
+        if lower >= upper:
+            return 0, 0, 0
+
+        sqrt_p = math.sqrt(price)
+        sqrt_pa = math.sqrt(lower)
+        sqrt_pb = math.sqrt(upper)
+
+        if price < lower:
+            cost_per_l = (1 / sqrt_pa - 1 / sqrt_pb) * price
+        elif price > upper:
+            cost_per_l = (sqrt_pb - sqrt_pa)
+        else:
+            cost_per_l = (1 / sqrt_p - 1 / sqrt_pb) * price + (sqrt_p - sqrt_pa)
+
+        # 3. Вычисляем новую L исходя из общей стоимости
+        l_new = current_val / cost_per_l if cost_per_l > 0 else 0
+
+        # 4. Получаем актуальные объемы токенов для этой L
+        a0, a1 = compute_v3_balances(l_new, lower, upper, price)
+        return l_new, a0, a1
+
     # Preview new balances
     if new_lower < new_upper:
-        new_l = compute_liquidity(current_price, new_lower, new_upper,
-                                  pos['token0_amount'], pos['token1_amount'])
-        new_a0, new_a1 = compute_v3_balances(new_l, new_lower, new_upper, current_price)
+        new_l, new_a0, new_a1 = calculate_rebalance(
+            current_price, new_lower, new_upper, pos['curr0'], pos['curr1']
+        )
         st.info(f"После ребалансировки: ≈{new_a0:.4g} {base_sym} + {new_a1:.4g} {quote_sym}")
 
     if st.button("✅ Подтвердить ребалансировку"):
         if new_lower >= new_upper:
             st.error("Нижняя граница должна быть меньше верхней!")
         else:
-            new_l = compute_liquidity(current_price, new_lower, new_upper,
-                                      pos['token0_amount'], pos['token1_amount'])
-            new_a0, new_a1 = compute_v3_balances(new_l, new_lower, new_upper, current_price)
+            new_l, new_a0, new_a1 = calculate_rebalance(
+                current_price, new_lower, new_upper, pos['curr0'], pos['curr1']
+            )
             update_position_ranges(pos_id, new_lower, new_upper, current_price, new_a0, new_a1, new_l)
             st.success("Диапазон обновлен!")
             st.rerun()
@@ -904,13 +932,29 @@ def render_position_card(pos):
                 st.progress(bar_pct)
                 st.caption(f"{range_label} (${lower:,.2f} – ${upper:,.2f})")
         
-        # ── Composition at bounds ─────────────────────────────────────────────
-        liquidity = float(pos.get('liquidity') or 0.0)
-        lower = float(pos.get('lower_price') or 0.0)
-        upper = float(pos.get('upper_price') or 0.0)
-        
-        if liquidity > 0:
-            bounds = get_composition_at_bounds(liquidity, lower, upper)
+            # Use pre-computed current token balances from enrichment loop
+            curr0 = pos.get('curr0', 0.0)
+            curr1 = pos.get('curr1', 0.0)
+
+            # Recalculate L from the fresh current balances at the current price
+            L_used = compute_liquidity(price, lower, upper, curr0, curr1)
+
+            bounds = get_composition_at_bounds(
+                liquidity=L_used,
+                lower_price=lower,
+                upper_price=upper,
+            )
+
+            # Guard: Clamp theoretical boundary amounts by actual available balances
+            if price < lower:
+                bounds['lower']['token0'] = min(bounds['lower']['token0'], curr0)
+                bounds['lower']['token1'] = min(bounds['lower']['token1'], curr1)
+            elif price > upper:
+                bounds['upper']['token0'] = min(bounds['upper']['token0'], curr0)
+                bounds['upper']['token1'] = min(bounds['upper']['token1'], curr1)
+
+            st.caption(f"DEBUG L used for bounds: {L_used:.4g}")
+
             st.markdown("---")
             st.markdown("**Состав на границах (без комиссий):**")
             b1, b2 = st.columns(2)
@@ -922,9 +966,6 @@ def render_position_card(pos):
                 st.markdown(f"🔺 **При ${upper:,.2f}:**")
                 st.markdown(f"≈ {bounds['upper']['token0']:.4g} {base_sym}")
                 st.caption(f"+ {bounds['upper']['token1']:,.2f} {quote_sym}")
-
-        else:
-            st.info("⚠️ Недостаточно данных для расчёта состава на границах (обновите позицию).")
 
         # ── Recommendation ────────────────────────────────────────────────────
         st.markdown(
@@ -1043,6 +1084,11 @@ def render_custom_position_card(cpos):
     current_body = float(cpos.get('current_body_usd') or 0.0)
     total_fees = float(cpos.get('total_fees_usd') or 0.0)
     initial_body = float(cpos.get('initial_body_usd') or 0.0)
+    # Fallback for old positions that stored raw token count instead of USD
+    if initial_body > 0 and abs(initial_body - amount_dep) / max(amount_dep, 1e-6) < 0.01:
+        initial_body = val_dep
+        if current_body > 0 and abs(current_body - amount_dep) / max(amount_dep, 1e-6) < 0.01:
+            current_body = val_dep
     actual_apy = cpos.get('actual_apy')
     stated_apy = cpos.get('apy')
 
