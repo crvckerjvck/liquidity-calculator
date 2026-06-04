@@ -1084,11 +1084,11 @@ def render_custom_position_card(cpos):
     current_body = float(cpos.get('current_body_usd') or 0.0)
     total_fees = float(cpos.get('total_fees_usd') or 0.0)
     initial_body = float(cpos.get('initial_body_usd') or 0.0)
-    # Fallback for old positions that stored raw token count instead of USD
-    if initial_body > 0 and abs(initial_body - amount_dep) / max(amount_dep, 1e-6) < 0.01:
-        initial_body = val_dep
-        if current_body > 0 and abs(current_body - amount_dep) / max(amount_dep, 1e-6) < 0.01:
-            current_body = val_dep
+    # Use val_dep for the "Начальный депозит" display (dynamic: amount * current_price)
+    # Keep initial_body (historical entry USD value) for PnL calculation
+    display_initial_body = val_dep if val_dep else initial_body
+    # "Текущее тело": dynamic by default (val_dep), unless manually updated via dialog
+    display_current_body = val_dep if (current_body == 0 or abs(current_body - initial_body) < 0.01) else current_body
     actual_apy = cpos.get('actual_apy')
     stated_apy = cpos.get('apy')
 
@@ -1149,14 +1149,16 @@ def render_custom_position_card(cpos):
         st.divider()
         metrics_cols = st.columns(4)
         with metrics_cols[0]:
-            st.metric("Начальный депозит", f"${initial_body:,.2f}" if initial_body else "—")
+            st.metric("Начальный депозит", f"${display_initial_body:,.2f}" if display_initial_body else "—")
         with metrics_cols[1]:
-            st.metric("Текущее тело", f"${current_body:,.2f}" if current_body else "—")
+            st.metric("Текущее тело", f"${display_current_body:,.2f}" if display_current_body else "—")
         with metrics_cols[2]:
             st.metric("Накопленные комиссии", f"${total_fees:,.2f}")
         with metrics_cols[3]:
-            pnl = (current_body + total_fees - initial_body) if initial_body > 0 else 0.0
-            pnl_pct = (pnl / initial_body * 100) if initial_body > 0 else 0.0
+            # PnL relative to historical entry cost (initial_body_usd = amount * historical_price)
+            hist_entry = initial_body if initial_body > 0 else display_initial_body
+            pnl = (display_current_body + total_fees - hist_entry) if hist_entry > 0 else 0.0
+            pnl_pct = (pnl / hist_entry * 100) if hist_entry > 0 else 0.0
             pnl_color = "#2ecc71" if pnl >= 0 else "#e74c3c"
             st.markdown(
                 f"<span style='font-size:0.85rem;color:#888;'>PnL</span><br>"
